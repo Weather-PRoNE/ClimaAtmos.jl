@@ -46,6 +46,18 @@ close_enough(a, b; rtol) = all(
     isapprox(parent(x), parent(y); rtol) for (x, y) in zip(components(a), components(b))
 )
 report(name, value) = println(rpad(name, 56), " = ", value)
+# Max |Δ Y.f.u₃| from `a` to `b` at the bottom face, the top face and the interior faces;
+# the first dimension of the parent array indexes the vertical levels.
+function face_split(a, b)
+    df = parent(b.f.u₃) .- parent(a.f.u₃)
+    nv = size(df, 1)
+    @assert nv == Spaces.nlevels(axes(Y.f))
+    return (
+        bottom = maximum(abs, selectdim(df, 1, 1)),
+        top = maximum(abs, selectdim(df, 1, nv)),
+        interior = maximum(abs, selectdim(df, 1, 2:(nv - 1))),
+    )
+end
 
 @testset "0 runtime assertions" begin
     report("do_dss(axes(Y.c))", CA.do_dss(axes(Y.c)))
@@ -53,21 +65,16 @@ report(name, value) = println(rpad(name, 56), " = ", value)
     qs = Spaces.quadrature_style(Spaces.horizontal_space(axes(Y.c)))
     report("quadrature style", qs)
     @test qs isa Quadratures.GLL{4}
-    for (name, expected) in (
-        (:turbconv_model, nothing),
-        (:rayleigh_sponge, nothing),
-        (:viscous_sponge, nothing),
-        (:ls_adv, nothing),
-    )
-        if hasproperty(p.atmos, name)
-            value = getproperty(p.atmos, name)
-            report("p.atmos.$name", value)
-            @test value === expected
-        else
-            report("p.atmos.$name", "FIELD ABSENT")
-            @test_broken hasproperty(p.atmos, name)
-        end
-    end
+    # `AtmosModel` forwards these grouped fields through `getproperty`, so
+    # `hasproperty` does not see them.
+    report("p.atmos.turbconv_model", p.atmos.turbconv_model)
+    @test p.atmos.turbconv_model === nothing
+    report("p.atmos.rayleigh_sponge", p.atmos.rayleigh_sponge)
+    @test p.atmos.rayleigh_sponge === nothing
+    report("p.atmos.viscous_sponge", p.atmos.viscous_sponge)
+    @test p.atmos.viscous_sponge === nothing
+    report("p.atmos.ls_adv", p.atmos.ls_adv)
+    @test p.atmos.ls_adv === nothing
     report("p.atmos.microphysics_model", typeof(p.atmos.microphysics_model))
     @test p.atmos.microphysics_model isa CA.DryModel
     user_callbacks = stock.callback.discrete_callbacks[1:(end - 1)]
@@ -87,6 +94,7 @@ report(name, value) = println(rpad(name, 56), " = ", value)
         (prob.f.update_cache, prob.f.update_constrain_state),
     )
     @test prob.f.update_cache isa CTS.UpdateEvery{CTS.EndOfStep}
+    @test prob.f.update_constrain_state isa CTS.UpdateEvery{CTS.EndOfStep}
 end
 
 obs = AP.Observer()
@@ -201,19 +209,13 @@ end
         ]
         report("$(entry.stage)/$(entry.hook)@$(entry.site) max|exit-entry| (c, f)", d)
         if entry.hook == :cache_imp! && entry.site in (:L219, :L235)
-            # Observed: `set_implicit_precomputed_quantities!` writes `Y.f` at these sites,
-            # so the brief's "U unchanged across cache_imp!" expectation does not hold.
-            df = parent(exit.data[:state].f) .- parent(entry.data[:state].f)
-            report(
-                "   Y.f names; max|Δ| bottom face / other faces",
-                (
-                    propertynames(entry.data[:state].f),
-                    maximum(abs, selectdim(df, 1, 1)),
-                    maximum(abs, selectdim(df, 1, 2:size(df, 1))),
-                ),
-            )
+            # `set_implicit_precomputed_quantities!` sets `Y.f.u₃` at the bottom and top
+            # faces; D004 classifies these writes as subordinate stage-processing entries.
+            Δ = face_split(entry.data[:state], exit.data[:state])
+            report("   Y.f names; max|Δ| bottom / top / interior faces", Δ)
+            @test exit.role == entry.role == :subordinate_stage_write
             @test d[1] == 0
-            @test_broken all(iszero, d)
+            @test maximum(Δ) > 0
         elseif entry.hook in (:cache_imp!, :T_post_imp!, :T_exp_T_lim!, :T_imp!)
             @test all(iszero, d)
         end
@@ -295,6 +297,11 @@ end
             (x, y) in zip(components(cache_exit), components(cache_entry.data[:state]))
         ],
     )
+    report(
+        "cache! max|Δ Y.f.u₃| bottom / top / interior faces",
+        face_split(cache_entry.data[:state], cache_exit),
+    )
+    @test cache_entry.role == obs.events[kc + 1].role == :final_map
     @test exact_equal(cache_exit, callback.data[:u])
     @test exact_equal(callback.data[:u], int_obs.u)
 end
@@ -335,7 +342,10 @@ checksum(x) = hash(Tuple(Array(parent(c)) for c in components(x)))
     end
     live_parents = [parent(c) for x in live for c in components(x)]
     copies = copied_states()
-    report("copied FieldVectors / live arrays", (length(copies), length(live)))
+    report(
+        "copied FieldVectors / live parent arrays",
+        (length(copies), length(live_parents)),
+    )
     @test all(x -> all(l -> x !== l, live), copies)
     @test all(x -> all(c -> all(l -> parent(c) !== l, live_parents), components(x)), copies)
     before = map(checksum, copies)
