@@ -57,10 +57,11 @@ record!(obs, hook, phase, site, point, role, t, data) = push!(
     Event(obs.step, obs.stage, point, hook, phase, site, role, t, data),
 )
 
-has_column(a, b, j) = !iszero(b[j]) || any(!iszero, a[:, j])
+has_column(a, b, j) = !iszero(b[j]) || any(i -> !iszero(a[i, j]), 1:length(b))
 
+# The tableau coefficients are immutable `SparseCoeffs` values, so storing them copies them.
 copy_tableau(tab) = Dict{Symbol, Any}(
-    name => copy(getproperty(tab, name)) for
+    name => getproperty(tab, name) for
     name in (:a_exp, :b_exp, :a_imp, :b_imp, :c_exp, :c_imp)
 )
 
@@ -169,8 +170,8 @@ function wrap_lim(f!, obs)
                     j => copy(cache.T_imp[j]) for
                     j in 1:s if has_column(tab.a_imp, tab.b_imp, j)
                 )
-                data[:b_exp] = copy(tab.b_exp)
-                data[:b_imp] = copy(tab.b_imp)
+                data[:b_exp] = tab.b_exp
+                data[:b_imp] = tab.b_imp
             end
         else
             site, point, role = :outside_step, 0, :initialization
