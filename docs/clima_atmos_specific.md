@@ -87,6 +87,13 @@ When reviewing or writing changes, name the validation surface explicitly:
   - Float32 simulations may have looser MSE thresholds. Document this explicitly when setting a new threshold.
   - References are published **on merge** via a two-step **stage → publish** flow, not by a full `main` build. **Stage:** a green PR build's final step (`reproducibility_tests/stage_output.jl` → `stage_pr_data`) copies the bundle to `…/climaatmos-main-staging/pr-<n>/`. **Publish:** on `main`, `.buildkite/pipeline.yml` runs `reproducibility_tests/publish_reference.jl`, which moves it into the reference store. `move_data_to_save_dir` is the direct-publish path used only by a merge-queue build (dormant while a merge queue is off). See `reproducibility_tests/README.md`.
 
+## Acquisition prototype (first-gate accounting, B001)
+
+  - `src/simulation/acquisition_prototype.jl` (module `ClimaAtmos.AcquisitionPrototype`, not exported, included from `src/ClimaAtmos.jl`) is a **prototype, local result** for the first-gate accepted-step accounting: an `Observer` collects copied events from the `ClimaODEFunction` hooks that `args_integrator` wires, and `instrumented_integrator(sim, observer)` builds a second integrator from a fresh simulation's problem with the stock callbacks kept. Where no hook exists it reads pinned ClimaTimeSteppers 1.0.1 internals (`cache.temp`, `cache.T_imp[i]`, the assembly channel arrays and `cache.tableau`); those reads break if `IMEXARKCache` changes and are being replaced by labelled solver events of the ClimaTimeSteppers fork (branch `b001-events`, `b001-events-integration` here).
+  - Pinned scope: ARS343 with the default `update_cache_every` / `update_constrain_state_every` (`step`), the dry `DryBaroclinicWave` sphere fixture (`h_elem 2`, `nh_poly 3`, `z_elem 10`, `dt 1 s`), diagnostics and progress logging off. Nothing in the module touches production code paths; without the observer no behaviour changes.
+  - Standalone test, not in `test/runtests.jl` and not run by CI: `julia +1.11 --project=.buildkite test/acquisition_prototype.jl` (114 checks: runtime fixture assertions, trace, observer on/off equality, no aliasing, per-hook differences, effective implicit identity, final maps and endpoint, declared-inactive counts).
+  - No accepted-run claim: the prototype establishes the hook sequence and copies on a 2-step fixture; it does not validate any accounting identity against a frozen criterion. The accounting contract and its decision records live outside this repository.
+
 ## Local commands
 
   - Prefer Julia 1.11.x for local work. GitHub CI runs every test group on 1.11 and only `infrastructure` on 1.10.
