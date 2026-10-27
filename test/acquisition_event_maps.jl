@@ -286,6 +286,57 @@ function check_stage_writes(::Type{FT}) where {FT}
         (maxdiff(double, Y_asm), length(children)),
     )
     @test maxdiff(double, Y_asm) > tol
+
+    #=
+    Weighted re-add of the stage children, against a hand derivation from the ARS343 tableau
+    (γ = g, a_imp[3, 2] = d = (1 − g)/2, b_imp = (0, b₁, b₂, g)) and this fixture (zero
+    rates, boundary u = 9, dt = 1). Stage i ∈ 2:4 starts from the boundary value Bᵢ = Ûᵢ; its
+    cache writes record Bᵢ → 0, Bᵢ (Newton restores Ûᵢ under a zero right-hand side) and
+    → 0 again, so Σₖ Δu₃ = −2Bᵢ, while its effective tendency is Tᵢ = −Bᵢ/(dt g). Hence
+    B₂ = 9, B₃ = 9 − 9d/g, B₄ = 9 − (b₁B₂ + b₂B₃)/g, so b₁B₂ + b₂B₃ + gB₄ = 9g and
+    Σᵢ (dt bᵢ/(dt g)) Σₖ Δu₃ = −(2/g)(b₁B₂ + b₂B₃ + gB₄) = −18 at each boundary face.
+    Bound: each Bᵢ comes from ≤ 8 roundings of the solver's stage arithmetic, each weight
+    from ≤ 2 and each weighted term from ≤ 2 more; with ≤ 12 roundings of relative size
+    eps/2, propagated through weights |bᵢ/g| ≤ 3, the error is ≤ 18 eps S with
+    S = Σᵢ |wᵢ| Σₖ |Δu₃|; we use 64 eps(FT) S. The unweighted sum −2(B₂ + B₃ + B₄) ≈ −1.83
+    and the sum without 1/dtγ, −2 · 9g ≈ −7.85, both miss −18 by far more.
+    =#
+    g = 0.4358665215084590
+    b_imp = FT.((0, -3 / 2 * g^2 + 4g - 1 / 4, 3 / 2 * g^2 - 5g + 5 / 4, g))
+    dt = a[:dt]
+    dtγ = dt * FT(g)
+    @test maximum(abs(a[:b_imp][j] - b_imp[j]) for j in 1:4) <= 4 * eps(FT)
+    for l in (half, 2 + half)
+        weighted_sum = unweighted = no_dtγ = scale_l = zero(FT)
+        outside = zero(FT)
+        for (x, y) in zip(children, entries)
+            @test x.site == y.site && x.stage == y.stage
+            Δ = u₃_level(x.data[:state], l) - u₃_level(y.data[:state], l)
+            unweighted += Δ
+            if x.stage in 2:4
+                w = dt * b_imp[x.stage] / dtγ
+                weighted_sum += w * Δ
+                no_dtγ += dt * b_imp[x.stage] * Δ
+                scale_l += abs(w) * abs(Δ)
+            else
+                outside += abs(Δ)
+            end
+        end
+        tol_w = 64 * eps(FT) * scale_l
+        report(
+            "C039 claim 5(b) $FT face $l weighted re-add (sum, bound)",
+            (weighted_sum, tol_w),
+        )
+        report(
+            "C039 claim 5(b) $FT face $l faults (unweighted, no 1/dtγ)",
+            (unweighted, no_dtγ),
+        )
+        @test outside == 0
+        @test abs(weighted_sum - (-18)) <= tol_w
+        # Faults: the unweighted sum and the sum without 1/dtγ.
+        @test abs(unweighted - (-18)) > tol_w
+        @test abs(no_dtγ - (-18)) > tol_w
+    end
 end
 
 # Nodal value at GLL point i of horizontal element h, level v.
