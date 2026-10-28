@@ -433,4 +433,252 @@ function instrumented_integrator(
     return integrator
 end
 
+# Event path (B001 T9): a ClimaTimeSteppers with labelled solver events reports the solver
+# internals that the path above reads from pinned cache fields and reconstructs with the
+# stage state machine. Only the model hooks are wrapped; everything else arrives as events.
+@static if isdefined(CTS, :supports_solver_events)
+
+    """
+        SITE_MAP
+
+    Solver-event sites (`CTS.Operation` `site`) mapped to the pinned 1.0.1 call-site label of
+    the prototype path, the hook called there and the B001 table rows of the entry and exit
+    records (local result, prototype; B001 T9). Sites outside the map do not execute with the
+    ClimaAtmos defaults; their events are recorded under their own name with hook `:operation`.
+    """
+    const SITE_MAP = Dict{
+        Symbol,
+        @NamedTuple{label::Symbol, hook::Symbol, points::Tuple{Int, Int}}
+    }(
+        :stage_lim => (label = :L160, hook = :lim!, points = (3, 3)),
+        :stage_dss_pre => (label = :L202, hook = :dss!, points = (4, 4)),
+        :init_imp => (label = :L215, hook = :initialize_imp!, points = (5, 6)),
+        :stage_dss_post_init => (label = :L216, hook = :dss!, points = (6, 6)),
+        :cache_imp_pre_newton => (label = :L219, hook = :cache_imp!, points = (6, 6)),
+        :cache_imp_post_newton => (label = :L235, hook = :cache_imp!, points = (8, 8)),
+        :post_imp_correction => (label = :L236, hook = :T_post_imp!, points = (9, 9)),
+        :stage_dss_post => (label = :L245, hook = :dss!, points = (9, 10)),
+        :stage_cache_fallback => (label = :L253, hook = :cache_imp!, points = (10, 10)),
+        :final_lim => (label = :L87, hook = :lim!, points = (14, 14)),
+        :final_dss => (label = :L98, hook = :dss!, points = (15, 16)),
+        :final_constrain =>
+            (label = :L100, hook = :constrain_state!, points = (17, 17)),
+        :final_cache => (label = :L101, hook = :cache!, points = (18, 18)),
+    )
+
+    """
+        EventObserver(observer = Observer())
+
+    Solver observer for `CTS.init(prob, alg; solver_observer)` (local result, prototype;
+    B001 T9). Called with each solver event, it copies the borrowed payloads at once and
+    records `Event`s in `observer`: `StepStart` gives point 1, `StageBaseline` the implicit
+    baseline `temp` (site `:baseline`), `EffectiveStorage` point 12, `AssemblyInputs`
+    point 13 and `Operation` the entry and exit records of the call sites in `SITE_MAP`.
+    `Event.step` counts the steps seen by the observer, `Event.stage` is `ctx.stage`
+    (`nothing` for step-level events) and `Event.t` is the step-start time `ctx.t`; the
+    stage times of an `Operation` are in `data[:t_exp]` and `data[:t_imp]`. The observer
+    never reads the integrator or its cache.
+    """
+    struct EventObserver
+        observer::Observer
+    end
+    EventObserver() = EventObserver(Observer())
+
+    stage_of(ctx) = iszero(ctx.stage) ? nothing : ctx.stage
+
+    # Tableau weights are immutable `SparseCoeffs`; arrays are copied.
+    snapshot(x) = ismutable(x) ? copy(x) : x
+
+    copy_columns(T, a, b) =
+        Dict(j => copy(T[j]) for j in 1:length(b) if has_column(a, b, j))
+
+    function (o::EventObserver)(event::CTS.StepStart)
+        obs = o.observer
+        ctx = event.ctx
+        obs.in_step = true
+        obs.step += 1
+        obs.stage = 1
+        obs.n_stages = length(event.tableau.b_exp)
+        data = Dict{Symbol, Any}(
+            :u => copy(event.u),
+            :dt => ctx.dt,
+            :integrator_step => ctx.step,
+            :tableau => copy_tableau(event.tableau),
+        )
+        record!(obs, :step_start, :entry, :L70, 1, :step_start, ctx.t, data)
+    end
+
+    function (o::EventObserver)(event::CTS.StageBaseline)
+        obs = o.observer
+        ctx = event.ctx
+        obs.stage = stage_of(ctx)
+        data = Dict{Symbol, Any}(:temp => copy(event.temp), :dtγ => ctx.dtγ)
+        record!(obs, :baseline, :exit, :baseline, 0, :implicit_setup, ctx.t, data)
+    end
+
+    function (o::EventObserver)(event::CTS.EffectiveStorage)
+        obs = o.observer
+        ctx = event.ctx
+        obs.stage = stage_of(ctx)
+        data = Dict{Symbol, Any}(
+            :T_imp_read => copy(event.T_imp_i),
+            :T_imp_index => event.i,
+            :U => copy(event.U),
+            :temp => copy(event.temp),
+            :dtγ => event.dtγ,
+        )
+        site = :effective_storage
+        record!(obs, site, :exit, site, 12, :effective_storage, ctx.t, data)
+    end
+
+    function (o::EventObserver)(event::CTS.AssemblyInputs)
+        obs = o.observer
+        ctx = event.ctx
+        obs.stage = nothing
+        tab = event.tableau
+        data = Dict{Symbol, Any}(
+            :u => copy(event.u),
+            :dt => event.dt,
+            :T_exp_all => copy_columns(event.T_exp, tab.a_exp, tab.b_exp),
+            :T_lim_all => copy_columns(event.T_lim, tab.a_exp, tab.b_exp),
+            :T_imp_all => copy_columns(event.T_imp, tab.a_imp, tab.b_imp),
+            :b_exp => snapshot(event.b_exp),
+            :b_imp => snapshot(event.b_imp),
+        )
+        site = :assembly_inputs
+        record!(obs, site, :entry, site, 13, :final_assembly, ctx.t, data)
+    end
+
+    function (o::EventObserver)(event::CTS.Operation)
+        obs = o.observer
+        ctx = event.ctx
+        obs.stage = stage_of(ctx)
+        data = state(event.state)
+        isnothing(event.extra) || (data[:extra] = copy(event.extra))
+        data[:dtγ] = ctx.dtγ
+        data[:t_exp] = ctx.t_exp
+        data[:t_imp] = ctx.t_imp
+        hook, point = if haskey(SITE_MAP, event.site)
+            mapped = SITE_MAP[event.site]
+            (mapped.hook, event.phase == :entry ? mapped.points[1] : mapped.points[2])
+        else
+            (:operation, 0)
+        end
+        record!(obs, hook, event.phase, event.site, point, event.role, ctx.t, data)
+    end
+
+    # Model-hook wrappers of the event path; the step and stage come from the events.
+    function event_wrap_T_exp_T_lim(f!, obs)
+        isnothing(f!) && return nothing
+        return function (T_exp_i, T_lim_i, U, p, t)
+            site, point = if !obs.in_step
+                (:outside_step, 0)
+            else
+                (:L273, obs.stage == 1 ? 2 : 11)
+            end
+            record!(obs, :T_exp_T_lim!, :entry, site, point, :stage_tendency, t, state(U))
+            result = f!(T_exp_i, T_lim_i, U, p, t)
+            data = state(U)
+            data[:T_exp] = copy(T_exp_i)
+            data[:T_lim] = copy(T_lim_i)
+            record!(obs, :T_exp_T_lim!, :exit, site, point, :stage_tendency, t, data)
+            return result
+        end
+    end
+
+    function event_wrap_T_imp(f!, obs)
+        return function (T_imp_i, U, p, t)
+            site = obs.in_step && !isnothing(obs.stage) ? :L311 : :unexpected
+            role = :provisional_evaluation
+            record!(obs, :T_imp!, :entry, site, 7, role, t, state(U))
+            result = f!(T_imp_i, U, p, t)
+            data = state(U)
+            data[:output] = copy(T_imp_i)
+            record!(obs, :T_imp!, :exit, site, 7, role, t, data)
+            return result
+        end
+    end
+
+    function event_wrap_T_post_imp(f!, obs)
+        isnothing(f!) && return nothing
+        return function (dU, U, p, t)
+            role = :correction_scratch
+            record!(obs, :T_post_imp!, :entry, :L236, 9, role, t, state(U))
+            result = f!(dU, U, p, t)
+            data = state(U)
+            data[:output] = copy(dU)
+            record!(obs, :T_post_imp!, :exit, :L236, 9, role, t, data)
+            return result
+        end
+    end
+
+    """
+        wrap_model_hooks(f::CTS.ClimaODEFunction, obs::Observer)
+
+    Return a new `ClimaODEFunction` whose model hooks (`T_exp_T_lim!`, `T_imp!`, `Wfact`,
+    `T_post_imp!`) record entry and exit events in `obs`; the solver-called hooks and the
+    update-signal policies are passed through unchanged (local result, prototype; B001 T9).
+    """
+    function wrap_model_hooks(f::CTS.ClimaODEFunction, obs::Observer)
+        fields = fieldnames(typeof(f))
+        Set(fields) == Set(CLIMA_ODE_FUNCTION_FIELDS) || error(
+            "ClimaODEFunction fields $(fields) differ from the pinned 1.0.1 set $(CLIMA_ODE_FUNCTION_FIELDS)",
+        )
+        T_imp! = if isnothing(f.T_imp!)
+            nothing
+        else
+            CTS.ODEFunction(
+                event_wrap_T_imp(f.T_imp!.f, obs);
+                jac_prototype = f.T_imp!.jac_prototype,
+                Wfact = wrap_Wfact(f.T_imp!.Wfact, obs),
+                tgrad = f.T_imp!.tgrad,
+            )
+        end
+        return CTS.ClimaODEFunction(;
+            T_exp_T_lim! = event_wrap_T_exp_T_lim(f.T_exp_T_lim!, obs),
+            T_imp!,
+            T_post_imp! = event_wrap_T_post_imp(f.T_post_imp!, obs),
+            f.lim!,
+            f.dss!,
+            f.constrain_state!,
+            f.initialize_imp!,
+            f.cache!,
+            f.cache_imp!,
+            f.update_cache,
+            f.update_constrain_state,
+        )
+    end
+
+    """
+        instrumented_integrator_events(sim, obs::EventObserver; callbacks)
+
+    Like `instrumented_integrator`, but the solver internals come from `CTS.init(...;
+    solver_observer = obs)` and only the model hooks are wrapped (`wrap_model_hooks`). The
+    observer's step-end callback is appended after `callbacks`. Local result, prototype
+    (B001 T9); the stock integrator of `sim` must not be stepped.
+    """
+    function instrumented_integrator_events(
+        sim,
+        obs::EventObserver;
+        callbacks = sim.integrator.callback.discrete_callbacks[1:(end - 1)],
+    )
+        stock = sim.integrator
+        prob = stock.sol.prob
+        inner = obs.observer
+        step_end_callback = CTS.DiscreteCallback(
+            (u, t, integrator) -> true,
+            integrator -> record_step_end!(inner, integrator),
+        )
+        return CTS.init(
+            CTS.ODEProblem(wrap_model_hooks(prob.f, inner), prob.u0, prob.tspan, prob.p),
+            stock.alg;
+            dt = stock._dt,
+            saveat = stock._saveat,
+            callback = CTS.CallbackSet(callbacks..., step_end_callback),
+            solver_observer = obs,
+        )
+    end
+
+end
+
 end
