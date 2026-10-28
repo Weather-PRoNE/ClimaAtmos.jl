@@ -227,7 +227,7 @@ end
         T_imp_read = reader.data[:T_imp_read]
         eff = similar(temp)
         # The same broadcast that ClimaTimeSteppers uses to set `T_imp[i]`, so every
-        # field must match bitwise.
+        # field must show exact numerical equality (zero maximum absolute difference).
         @. eff = (U_exit - temp) / dtγ
         Δ = field_absdiff(T_imp_read, eff)
         @test Δ == map(zero, Δ)
@@ -246,7 +246,8 @@ end
         k -> final_lim.data[k],
         (:T_exp_all, :T_lim_all, :T_imp_all, :b_exp, :b_imp),
     )
-    # Observed bitwise on this fixture.
+    # Observed as exact numerical equality (zero maximum absolute difference) on this
+    # fixture.
     temp_rebuilt = copy(u_ref)
     for (j, T_lim_j) in T_lim_all
         @. temp_rebuilt += dt * b_exp[j] * T_lim_j
@@ -264,6 +265,7 @@ end
     end
     final_dss = only(e for e in es if e.hook == :dss! && e.site == :L98)
     rel = field_reldiff(final_dss.data[:state], Y_asm)
+    report("final assembly max relative residual", rel)
     @test all(≤(1e-5), rel)
     cache_entry = only(e for e in es if e.hook == :cache! && e.site == :L101)
     kc = findfirst(==(cache_entry), obs.events)
@@ -312,8 +314,12 @@ checksum(x) = hash(Tuple(Array(parent(c)) for c in components(x)))
     # A `SparseContainer` keeps its stored tableau columns in its single field; its type
     # parameter maps tableau columns to positions in it and is not an index list.
     stored(c::CTS.SparseContainer) = getfield(c, only(fieldnames(typeof(c))))
-    stored(_) = ()
-    for container in (cache.T_exp, cache.T_lim, cache.T_imp), buffer in stored(container)
+    stored(::Nothing) = ()
+    containers = (cache.T_exp, cache.T_lim, cache.T_imp)
+    layout = map(c -> (nameof(typeof(c)), length(stored(c))), containers)
+    report("T_exp, T_lim, T_imp container type and buffer count", layout)
+    @test layout == ((:SparseContainer, 4), (:SparseContainer, 4), (:SparseContainer, 3))
+    for container in containers, buffer in stored(container)
         push!(live, buffer)
     end
     live_parents = [parent(c) for x in live for c in components(x)]
