@@ -8,7 +8,7 @@ import ClimaCore.Utilities: half
 
 # Standalone event-channel checks of B001 acceptance claim 6 on the ClimaAtmos side (B001 T9
 # part 2, C037 T3); not part of runtests.jl. Needs a ClimaTimeSteppers with labelled solver
-# events. Expected values are the frozen C037 T0 Section 6 oracles; these are diagnostic
+# events. Expected values are hand-derived from the states below; these are diagnostic
 # states, not an atmospheric evolution.
 const AP = CA.AcquisitionPrototype
 println("CTS from ", pathof(CTS))

@@ -9,16 +9,12 @@ import ClimaCore.Utilities: half
 
 # Standalone event-channel checks of B001 acceptance claim 5 on the ClimaAtmos side (B001 T9
 # part 2, C037 T3); not part of runtests.jl. Needs a ClimaTimeSteppers with labelled solver
-# events. Expected values are the frozen C037 T0 Section 5 oracles or exact identities.
+# events. Expected values are hand-derived from the fixtures (derivations at each fixture
+# below) or exact identities.
 const AP = CA.AcquisitionPrototype
 println("CTS from ", pathof(CTS))
 
-components(x) = (getproperty(x, k) for k in propertynames(x))
-exact_equal(a, b) =
-    all(parent(x) == parent(y) for (x, y) in zip(components(a), components(b)))
-maxdiff(a, b) = maximum(
-    maximum(abs, parent(x) .- parent(y)) for (x, y) in zip(components(a), components(b))
-)
+include("acquisition_helpers.jl")
 report(name, value) = println(rpad(name, 60), " = ", value)
 
 # `prepare!` acts on the state after `CTS.init`, whose own `cache!` call would otherwise

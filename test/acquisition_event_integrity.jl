@@ -7,7 +7,7 @@ import ClimaTimeSteppers as CTS
 
 # Standalone event-channel checks of B001 acceptance claim 7 on the ClimaAtmos side (B001 T9
 # part 2, C037 T3); not part of runtests.jl. Needs a ClimaTimeSteppers with labelled solver
-# events. The template is the frozen C037 T0 Section 7 trace for this configuration; all
+# events. The template is the hand-derived event trace for this configuration; all
 # comparisons are exact except the endpoint value (see `endpoint_bound`).
 const AP = CA.AcquisitionPrototype
 println("CTS from ", pathof(CTS))

@@ -8,17 +8,12 @@ import ClimaCore: CommonSpaces, Fields, Geometry, Spaces
 
 # Standalone event-channel checks of B001 acceptance claims 2–4 on the ClimaAtmos side
 # (B001 T9 part 2, C037); not part of runtests.jl. Needs a ClimaTimeSteppers with labelled
-# solver events. Expected values are the frozen C037 T0 oracles (Sections 3 and 4) or exact
-# identities; none is taken from the code under test.
+# solver events. Expected values are hand-derived from the fixtures (derivations at each
+# fixture below) or exact identities; none is taken from the code under test.
 const AP = CA.AcquisitionPrototype
 println("CTS from ", pathof(CTS))
 
-components(x) = (getproperty(x, k) for k in propertynames(x))
-exact_equal(a, b) =
-    all(parent(x) == parent(y) for (x, y) in zip(components(a), components(b)))
-maxdiff(a, b) = maximum(
-    maximum(abs, parent(x) .- parent(y)) for (x, y) in zip(components(a), components(b))
-)
+include("acquisition_helpers.jl")
 report(name, value) = println(rpad(name, 60), " = ", value)
 
 # Runs one ARS343 step of `f` from `u0` through A's model-hook wrappers and event observer.
