@@ -26,8 +26,11 @@ config = CA.AtmosConfig(
     );
     job_id = "b001_t2_acquisition",
 )
-sim_ref = CA.get_simulation(config)
-sim_obs = CA.get_simulation(config)
+# Construction inside a testset so that a setup error still prints a summary.
+@testset "setup" begin
+    global sim_ref = CA.get_simulation(config)
+    global sim_obs = CA.get_simulation(config)
+end
 int_ref = sim_ref.integrator
 stock = sim_obs.integrator
 prob = stock.sol.prob
@@ -36,14 +39,19 @@ p = prob.p
 FT = eltype(parent(Y.c))
 
 components(x) = (getproperty(x, k) for k in propertynames(x))
-maxdiff(a, b) = maximum(
-    maximum(abs, parent(x) .- parent(y)) for (x, y) in zip(components(a), components(b))
-)
-maxabs(a) = maximum(maximum(abs, parent(x)) for x in components(a))
 exact_equal(a, b) =
     all(parent(x) == parent(y) for (x, y) in zip(components(a), components(b)))
-close_enough(a, b; rtol) = all(
-    isapprox(parent(x), parent(y); rtol) for (x, y) in zip(components(a), components(b))
+# The prognostic fields of the fixture, compared one at a time: `ρe_tot` is O(10⁵)
+# while `ρ` is O(1), so a comparison over the stacked `parent(Y.c)` would hide
+# errors in `ρ` and the velocities.
+fields(x) = (ρ = x.c.ρ, ρe_tot = x.c.ρe_tot, uₕ = x.c.uₕ, u₃ = x.f.u₃)
+# Per field: max |a - b|, and the same normalised by the field's own max |b|.
+field_absdiff(a, b) =
+    map((x, y) -> maximum(abs, parent(x) .- parent(y)), fields(a), fields(b))
+field_reldiff(a, b) = map(
+    (x, y) -> maximum(abs, parent(x) .- parent(y)) / maximum(abs, parent(y)),
+    fields(a),
+    fields(b),
 )
 report(name, value) = println(rpad(name, 56), " = ", value)
 # Max |Δ Y.f.u₃| from `a` to `b` at the bottom face, the top face and the interior faces;
@@ -98,10 +106,12 @@ end
 end
 
 obs = AP.Observer()
-int_obs = AP.instrumented_integrator(sim_obs, obs)
-for _ in 1:2
-    CTS.step!(int_ref)
-    CTS.step!(int_obs)
+@testset "setup: two steps" begin
+    global int_obs = AP.instrumented_integrator(sim_obs, obs)
+    for _ in 1:2
+        CTS.step!(int_ref)
+        CTS.step!(int_obs)
+    end
 end
 
 entries(step) = [e for e in obs.events if e.step == step && e.phase == :entry]
@@ -123,8 +133,6 @@ const MAPPED_HOOKS = (
 )
 
 @testset "1 trace" begin
-    init_events = [e for e in obs.events if e.step == 0]
-    report("step-0 events", [(e.hook, e.phase, e.site) for e in init_events])
     stage_seq = [
         :lim!,
         :dss!,
@@ -144,38 +152,20 @@ const MAPPED_HOOKS = (
     )
     for step in 1:2
         es = filter(e -> e.hook != :step_start, entries(step))
-        println(
-            "step $step raw sequence: ",
-            join(["$(e.stage)/$(e.hook)@$(e.site)" for e in es], " "),
-        )
-        counts = Dict(
-            h => count(e -> e.hook == h, es) for h in (MAPPED_HOOKS..., :T_imp!, :Wfact)
-        )
-        report("step $step counts", sort(collect(counts); by = first))
-        report(
-            "step $step cache_imp! outside Newton",
-            count(e -> e.hook == :cache_imp! && !newton_internal(e), es),
-        )
-        for stage in 2:4
-            report(
-                "step $step stage $stage Newton cache_imp! / T_imp! / Wfact",
-                (
-                    count(
-                        e -> e.stage == stage && e.hook == :cache_imp! && e.site == :newton,
-                        es,
-                    ),
-                    count(e -> e.stage == stage && e.hook == :T_imp!, es),
-                    count(e -> e.stage == stage && e.hook == :Wfact, es),
-                ),
-            )
-        end
-        report(
-            "step $step callback events",
-            count(e -> e.hook == :step_end_callback && e.step == step, obs.events),
-        )
         observed = [e.hook for e in es if !newton_internal(e)]
-        step == 2 && @test observed == expected
-        step == 2 && observed != expected && println("observed: ", observed)
+        @test observed == expected
+        # One Newton iteration per implicit stage: one `T_imp!` and one `Wfact` each,
+        # and no `cache_imp!` inside Newton.
+        for stage in 2:4
+            in_stage(h) = count(e -> e.stage == stage && e.hook == h, es)
+            @test (in_stage(:T_imp!), in_stage(:Wfact)) == (1, 1)
+            @test count(
+                e -> e.stage == stage && e.hook == :cache_imp! && e.site == :newton,
+                es,
+            ) == 0
+        end
+        @test count(e -> e.hook == :Wfact, es) == 3
+        @test count(e -> e.hook == :step_end_callback && e.step == step, obs.events) == 1
         @test count(e -> e.site == :unexpected, es) == 0
     end
     start = only(e for e in entries(2) if e.hook == :step_start)
@@ -203,19 +193,16 @@ end
     for (entry, exit) in pairs_of(2)
         @test exit.hook == entry.hook && exit.phase == :exit
         haskey(entry.data, :state) || continue
-        d = [
-            maximum(abs, parent(x) .- parent(y)) for
-            (x, y) in zip(components(exit.data[:state]), components(entry.data[:state]))
-        ]
-        report("$(entry.stage)/$(entry.hook)@$(entry.site) max|exit-entry| (c, f)", d)
+        d = field_absdiff(exit.data[:state], entry.data[:state])
         if entry.hook == :cache_imp! && entry.site in (:L219, :L235)
             # `set_implicit_precomputed_quantities!` sets `Y.f.u₃` at the bottom and top
             # faces; D004 classifies these writes as subordinate stage-processing entries.
-            Δ = face_split(entry.data[:state], exit.data[:state])
-            report("   Y.f names; max|Δ| bottom / top / interior faces", Δ)
+            Δf = face_split(entry.data[:state], exit.data[:state])
             @test exit.role == entry.role == :subordinate_stage_write
-            @test d[1] == 0
-            @test maximum(Δ) > 0
+            @test (d.ρ, d.ρe_tot, d.uₕ) == (0, 0, 0)
+            @test Δf.bottom > 0
+            @test Δf.top > 0
+            @test Δf.interior == 0
         elseif entry.hook in (:cache_imp!, :T_post_imp!, :T_exp_T_lim!, :T_imp!)
             @test all(iszero, d)
         end
@@ -239,10 +226,11 @@ end
             only(e for e in es if e.hook == :lim! && get(e.data, :T_imp_index, 0) == stage)
         T_imp_read = reader.data[:T_imp_read]
         eff = similar(temp)
+        # The same broadcast that ClimaTimeSteppers uses to set `T_imp[i]`, so every
+        # field must match bitwise.
         @. eff = (U_exit - temp) / dtγ
-        rel = maxdiff(T_imp_read, eff) / maxabs(eff)
-        report("stage $stage dtγ / max rel diff T_imp vs (U-temp)/dtγ", (dtγ, rel))
-        @test close_enough(T_imp_read, eff; rtol = 1e-5)
+        Δ = field_absdiff(T_imp_read, eff)
+        @test Δ == map(zero, Δ)
     end
 end
 
@@ -252,27 +240,21 @@ end
     k = findfirst(==(final_lim), obs.events)
     temp_exit = obs.events[k + 1].data[:state]
     u_ref = final_lim.data[:u_ref]
-    report("final lim!: max|applied limited contribution|", maxdiff(temp_exit, u_ref))
-    report("final lim!: max|exit - entry|", maxdiff(temp_exit, final_lim.data[:state]))
     start = only(e for e in es if e.hook == :step_start)
     dt = FT(float(start.data[:dt]))
     T_exp_all, T_lim_all, T_imp_all, b_exp, b_imp = map(
         k -> final_lim.data[k],
         (:T_exp_all, :T_lim_all, :T_imp_all, :b_exp, :b_imp),
     )
-    report(
-        "b_exp / b_imp / implicit columns",
-        (b_exp, b_imp, sort(collect(keys(T_imp_all)))),
-    )
+    # Observed bitwise on this fixture.
     temp_rebuilt = copy(u_ref)
     for (j, T_lim_j) in T_lim_all
         @. temp_rebuilt += dt * b_exp[j] * T_lim_j
     end
-    report(
-        "final lim! entry vs u + dt Σ b_exp T_lim (rel)",
-        maxdiff(temp_rebuilt, final_lim.data[:state]) / maxabs(temp_rebuilt),
-    )
-    @test close_enough(final_lim.data[:state], temp_rebuilt; rtol = 1e-5)
+    Δ = field_absdiff(final_lim.data[:state], temp_rebuilt)
+    @test Δ == map(zero, Δ)
+    # The assembly sums the columns in a different order than the solver's fused
+    # broadcast, so it matches to rounding only; each field is scaled by its own max.
     Y_asm = copy(temp_exit)
     for (j, T_exp_j) in T_exp_all
         @. Y_asm += dt * b_exp[j] * T_exp_j
@@ -281,26 +263,19 @@ end
         @. Y_asm += dt * b_imp[j] * T_imp_j
     end
     final_dss = only(e for e in es if e.hook == :dss! && e.site == :L98)
-    report(
-        "final dss! entry vs temp + inc_exp + inc_imp (rel)",
-        maxdiff(Y_asm, final_dss.data[:state]) / maxabs(Y_asm),
-    )
-    @test close_enough(final_dss.data[:state], Y_asm; rtol = 1e-5)
+    rel = field_reldiff(final_dss.data[:state], Y_asm)
+    @test all(≤(1e-5), rel)
     cache_entry = only(e for e in es if e.hook == :cache! && e.site == :L101)
     kc = findfirst(==(cache_entry), obs.events)
     cache_exit = obs.events[kc + 1].data[:state]
     callback = only(e for e in obs.events if e.step == 2 && e.hook == :step_end_callback)
-    report(
-        "cache! entry vs exit (c, f)",
-        [
-            maximum(abs, parent(x) .- parent(y)) for
-            (x, y) in zip(components(cache_exit), components(cache_entry.data[:state]))
-        ],
-    )
-    report(
-        "cache! max|Δ Y.f.u₃| bottom / top / interior faces",
-        face_split(cache_entry.data[:state], cache_exit),
-    )
+    # The final `cache!` writes `Y.f.u₃` at the boundary faces: the top face and, by a
+    # smaller amount (7.7e-7 vs 1.1e-5 on this fixture), the bottom face.
+    Δ = field_absdiff(cache_exit, cache_entry.data[:state])
+    @test (Δ.ρ, Δ.ρe_tot, Δ.uₕ) == (0, 0, 0)
+    Δf = face_split(cache_entry.data[:state], cache_exit)
+    @test Δf.top > 0
+    @test Δf.interior == 0
     @test cache_entry.role == obs.events[kc + 1].role == :final_map
     @test exact_equal(cache_exit, callback.data[:u])
     @test exact_equal(callback.data[:u], int_obs.u)
@@ -329,23 +304,20 @@ copied_states() = [
 ]
 checksum(x) = hash(Tuple(Array(parent(c)) for c in components(x)))
 
+# Runs last although numbered 3: it mutates `int_obs.u` and takes a third step, which
+# would change the state and the event list that testsets 1, 2 and 4–7 read.
 @testset "3 no aliasing" begin
     cache = int_obs.cache
     live = Any[int_obs.u, cache.U, cache.temp]
-    for j in 1:4
-        for container in (cache.T_exp, cache.T_lim, cache.T_imp)
-            try
-                push!(live, container[j])
-            catch
-            end
-        end
+    # A `SparseContainer` stores only the tableau columns listed in its type parameter.
+    stored(::CTS.SparseContainer{I}) where {I} = I
+    stored(_) = ()
+    for container in (cache.T_exp, cache.T_lim, cache.T_imp), j in stored(container)
+        push!(live, container[j])
     end
     live_parents = [parent(c) for x in live for c in components(x)]
     copies = copied_states()
-    report(
-        "copied FieldVectors / live parent arrays",
-        (length(copies), length(live_parents)),
-    )
+    @test !isempty(copies)
     @test all(x -> all(l -> x !== l, live), copies)
     @test all(x -> all(c -> all(l -> parent(c) !== l, live_parents), components(x)), copies)
     before = map(checksum, copies)
