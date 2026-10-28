@@ -309,11 +309,12 @@ checksum(x) = hash(Tuple(Array(parent(c)) for c in components(x)))
 @testset "3 no aliasing" begin
     cache = int_obs.cache
     live = Any[int_obs.u, cache.U, cache.temp]
-    # A `SparseContainer` stores only the tableau columns listed in its type parameter.
-    stored(::CTS.SparseContainer{I}) where {I} = I
+    # A `SparseContainer` keeps its stored tableau columns in its single field; its type
+    # parameter maps tableau columns to positions in it and is not an index list.
+    stored(c::CTS.SparseContainer) = getfield(c, only(fieldnames(typeof(c))))
     stored(_) = ()
-    for container in (cache.T_exp, cache.T_lim, cache.T_imp), j in stored(container)
-        push!(live, container[j])
+    for container in (cache.T_exp, cache.T_lim, cache.T_imp), buffer in stored(container)
+        push!(live, buffer)
     end
     live_parents = [parent(c) for x in live for c in components(x)]
     copies = copied_states()
