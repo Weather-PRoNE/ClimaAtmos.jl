@@ -8,8 +8,8 @@ import ClimaCore: CommonSpaces, Fields, Geometry, Spaces
 
 # Standalone event-channel checks of B001 acceptance claims 2–4 on the ClimaAtmos side
 # (B001 T9 part 2, C037); not part of runtests.jl. Needs a ClimaTimeSteppers with labelled
-# solver events. Expected values are hand-derived from the fixtures (derivations at each
-# fixture below) or exact identities; none is taken from the code under test.
+# solver events. Expected values are specified alongside the fixtures below, with
+# derivations for selected checks and exact identities for others.
 const AP = CA.AcquisitionPrototype
 println("CTS from ", pathof(CTS))
 
