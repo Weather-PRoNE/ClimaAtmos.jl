@@ -87,6 +87,11 @@ When reviewing or writing changes, name the validation surface explicitly:
   - Float32 simulations may have looser MSE thresholds. Document this explicitly when setting a new threshold.
   - References are published **on merge** via a two-step **stage → publish** flow, not by a full `main` build. **Stage:** a green PR build's final step (`reproducibility_tests/stage_output.jl` → `stage_pr_data`) copies the bundle to `…/climaatmos-main-staging/pr-<n>/`. **Publish:** on `main`, `.buildkite/pipeline.yml` runs `reproducibility_tests/publish_reference.jl`, which moves it into the reference store. `move_data_to_save_dir` is the direct-publish path used only by a merge-queue build (dormant while a merge queue is off). See `reproducibility_tests/README.md`.
 
+## Acquisition prototype (first-gate accounting, B001)
+
+  - `src/simulation/acquisition_prototype.jl` (module `ClimaAtmos.AcquisitionPrototype`, not exported) is a prototype for the first-gate accepted-step accounting: an `Observer` collects copied events from the `ClimaODEFunction` hooks that `args_integrator` wires, and `instrumented_integrator(sim, observer)` builds a second integrator from a fresh simulation's problem with the stock callbacks kept. Where no hook exists it reads ClimaTimeSteppers 1.0.1 internals (`cache.temp`, `cache.T_imp[i]`, the assembly channel arrays, `cache.tableau`), so it breaks if `IMEXARKCache` changes. It supports only ARS343 with the default cache and constraint update frequencies on the dry `DryBaroclinicWave` sphere fixture used by the test; without an observer no behaviour changes.
+  - Run its standalone test (not in `test/runtests.jl`, not run by CI) with `julia +1.11 --project=.buildkite test/acquisition_prototype.jl`.
+
 ## Local commands
 
   - Prefer Julia 1.11.x for local work. GitHub CI runs every test group on 1.11 and only `infrastructure` on 1.10.

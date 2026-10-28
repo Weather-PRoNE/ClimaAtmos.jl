@@ -195,6 +195,7 @@ include(joinpath("parameters", "create_parameters.jl"))
 include(joinpath("simulation", "grids.jl"))
 include(joinpath("simulation", "restart.jl"))
 include(joinpath("simulation", "integrator.jl"))
+include(joinpath("simulation", "acquisition_prototype.jl"))
 include(joinpath("simulation", "AtmosSimulations.jl"))
 include(joinpath("simulation", "solve.jl"))
 
