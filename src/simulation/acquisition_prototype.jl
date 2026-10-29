@@ -20,6 +20,32 @@ state is a `copy`; no event holds a reference to a solver array.
     consumer checks acquired events. A hook call that executes as a no-op is still an
     expected event; an inactive declaration means the call is not expected to execute.
 
+# Event points
+
+`Event.point` takes these values (sites are pinned ClimaTimeSteppers 1.0.1 lines):
+
+  - 0: not mapped: a call outside a step (`:outside_step`, `:init`), an unexpected call
+    (`:unexpected`) or a Newton-internal call (`:newton`)
+  - 1: step start (`:L70`)
+  - 2: first explicit tendency, `T_exp_T_lim!` in stage 1 (`:L273`)
+  - 3: stage limiter `lim!` (`:L160`)
+  - 4: `dss!` before the implicit snapshot (`:L202`)
+  - 5: `initialize_imp!` entry (`:L215`)
+  - 6: `initialize_imp!` exit, then `dss!` (`:L216`) and `cache_imp!` (`:L219`)
+  - 7: implicit tendency `T_imp!` in the Newton solve (`:L311`)
+  - 8: `cache_imp!` after the Newton solve (`:L235`)
+  - 9: `T_post_imp!` (`:L236`) and the `dss!` entry (`:L245`)
+  - 10: the `dss!` exit (`:L245`), `cache_imp!` (`:L253`), and `constrain_state!` or
+    `cache!` inside a stage
+  - 11: stage tendency `T_exp_T_lim!` in later stages (`:L273`)
+  - 12: cached `T_imp` of the previous stage, read at the next `lim!` entry
+  - 13: channel arrays and weights of the final assembly, read at the final `lim!` entry
+  - 14: final limiter `lim!` (`:L87`)
+  - 15, 16: final `dss!` entry and exit (`:L98`)
+  - 17: final `constrain_state!` (`:L100`)
+  - 18: final `cache!` (`:L101`)
+  - 19: the observer's step-end callback
+
 This module only records observations. Neither it nor the model depends on any consumer.
 Not part of the public API; nothing is exported.
 """
@@ -33,7 +59,7 @@ import ClimaCore: Fields
 
 One raw-acquisition record: a copied observation, not yet normalized. `stage` is 1–4
 inside a stage and `nothing` for the final maps, the callbacks and initialization; `point`
-is the event point, the row of the first-gate acquisition table (0 if not mapped); `site`
+is the event point, listed in the module docstring (0 if not mapped); `site`
 names the pinned ClimaTimeSteppers 1.0.1 call site (`:L160` is `imex_ark.jl:160`,
 `:newton` is a call inside the Newton solve); `role` is the role of the observed call in
 the step; `phase` is `:entry` (before the call) or `:exit` (after it).
@@ -136,7 +162,8 @@ state(U) = Dict{Symbol, Any}(:state => copy(U))
     wrap_T_exp_T_lim(f!, obs)
 
 Wrap the `T_exp_T_lim!` hook (site `:L273`): point 2 in stage 1, after `begin_step!`, and
-point 11 in later stages. Entry copies `U`; exit copies `U`, `T_exp_i` and `T_lim_i`.
+point 11 in later stages; point 0 (`:outside_step`) when called outside a step. Entry
+copies `U`; exit copies `U`, `T_exp_i` and `T_lim_i`.
 """
 function wrap_T_exp_T_lim(f!, obs)
     isnothing(f!) && return nothing
@@ -164,9 +191,10 @@ end
     wrap_lim(f!, obs)
 
 Wrap the `lim!` hook. Stage limiter (`:L160`, point 3): entry copies `U`, `u_ref` and the
-cached `T_imp` of the previous stage (point 12). Final limiter (`:L87`, point 14): entry
-also copies the channel arrays and weights of the final assembly (point 13). Exit copies
-`U`.
+cached `T_imp` of the previous stage (point 12), but only when that stage's implicit
+column or weight is nonzero (`has_column`). Final limiter (`:L87`, point 14): entry takes
+the same `T_imp` copy and also copies the channel arrays and weights of the final assembly
+(point 13). Outside a step the call records point 0 (`:outside_step`). Exit copies `U`.
 """
 function wrap_lim(f!, obs)
     isnothing(f!) && return nothing
@@ -243,7 +271,8 @@ end
     wrap_dss(f!, obs)
 
 Wrap the `dss!` hook; `classify_dss!` maps the call to `:L202` (point 4), `:L216`
-(point 6), `:L245` (points 9 and 10) or the final `:L98` (points 15 and 16). Entry and
+(point 6), `:L245` (points 9 and 10) or the final `:L98` (points 15 and 16), and to point 0
+outside a step (`:outside_step`) or in an unexpected stage phase (`:unexpected`). Entry and
 exit copy `U`.
 """
 function wrap_dss(f!, obs)
@@ -261,7 +290,7 @@ end
     wrap_constrain_state(f!, obs)
 
 Wrap the `constrain_state!` hook: final map `:L100` (point 17) or a call inside a stage
-(point 10). Entry and exit copy `U`.
+(point 10); point 0 (`:outside_step`) when called outside a step. Entry and exit copy `U`.
 """
 function wrap_constrain_state(f!, obs)
     isnothing(f!) && return nothing
@@ -308,7 +337,8 @@ end
 
 Wrap the `cache_imp!` hook: `:L219` before the Newton solve (point 6), Newton-internal
 calls (`:newton`, point 0; `wrap_T_post_imp` relabels the last pair to `:L235`, point 8)
-and `:L253` (point 10). Entry and exit copy `U`.
+and `:L253` (point 10); point 0 outside a step (`:outside_step`) or in an unexpected stage
+phase (`:unexpected`). Entry and exit copy `U`.
 """
 function wrap_cache_imp(f!, obs)
     isnothing(f!) && return nothing
