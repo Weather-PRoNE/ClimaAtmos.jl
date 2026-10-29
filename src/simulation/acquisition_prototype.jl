@@ -1,12 +1,26 @@
 """
     AcquisitionPrototype
 
-Prototype acquisition layer (local result, prototype; B001 T2). It observes IMEX ARK steps
-of a ClimaAtmos simulation by wrapping the hooks of the `ClimaTimeSteppers.ClimaODEFunction`
-that `args_integrator` wires, and by reading pinned ClimaTimeSteppers 1.0.1 cache fields
+Prototype acquisition layer. It observes IMEX ARK steps of a ClimaAtmos simulation by
+wrapping the hooks of the `ClimaTimeSteppers.ClimaODEFunction` that `args_integrator`
+wires, and by reading pinned ClimaTimeSteppers 1.0.1 cache fields
 (`integrator.cache.T_exp`, `T_lim`, `T_imp`, `tableau`) where no hook exists. Every recorded
 state is a `copy`; no event holds a reference to a solver array.
 
+# Event-point vocabulary
+
+  - **Raw acquisition**: the `Event`s in `Observer.events`, i.e. the copied solver-event
+    and model-hook observations in call order, before normalization. Each hook call gives
+    an entry and an exit record, and Newton-internal calls add records, so the raw event
+    count is not interchangeable with the event count of the normalized template.
+  - **Acceptance trace**: the normalized, ordered per-step event template of the frozen
+    first-gate harness. Consumers (the downstream harness) normalize the raw acquisition
+    into records and this trace; it is not a complete Newton-internal trace.
+  - **Expected event**: a declared event key, role, activity and reason against which the
+    consumer checks acquired events. A hook call that executes as a no-op is still an
+    expected event; an inactive declaration means the call is not expected to execute.
+
+This module only records observations. Neither it nor the model depends on any consumer.
 Not part of the public API; nothing is exported.
 """
 module AcquisitionPrototype
@@ -17,10 +31,12 @@ import ClimaCore: Fields
 """
     Event
 
-One observation. `stage` is 1–4 inside a stage and `nothing` for the final maps, the
-callbacks and initialization; `point` is the row of the B001 acquisition table (0 if not
-mapped); `site` names the pinned ClimaTimeSteppers 1.0.1 call site (`:L160` is
-`imex_ark.jl:160`, `:newton` is a call inside the Newton solve); `role` follows D004.
+One raw-acquisition record: a copied observation, not yet normalized. `stage` is 1–4
+inside a stage and `nothing` for the final maps, the callbacks and initialization; `point`
+is the event point, the row of the first-gate acquisition table (0 if not mapped); `site`
+names the pinned ClimaTimeSteppers 1.0.1 call site (`:L160` is `imex_ark.jl:160`,
+`:newton` is a call inside the Newton solve); `role` is the role of the observed call in
+the step; `phase` is `:entry` (before the call) or `:exit` (after it).
 """
 struct Event
     step::Int
@@ -37,8 +53,9 @@ end
 """
     Observer()
 
-Mutable container of `Event`s plus the stage bookkeeping state. `integrator` is set by
-`instrumented_integrator` and is read for `u`, `t`, `dt`, `step` and the cache fields.
+Mutable container of the raw acquisition (`events`) plus the stage bookkeeping state.
+`integrator` is set by `instrumented_integrator` and is read for `u`, `t`, `dt`, `step`
+and the cache fields. Consumers read `events` after the run and normalize them.
 """
 mutable struct Observer
     events::Vector{Event}
@@ -81,6 +98,13 @@ copy_tableau(tab) = Dict{Symbol, Any}(
 # apart from a Newton-internal callback when it happens, so the last `cache_imp!` pair
 # before `T_post_imp!` is relabelled from `:newton` to `:L235` at the `T_post_imp!` entry.
 
+"""
+    begin_step!(obs, U)
+
+Record event point 1 (step start) at the first `T_exp_T_lim!` entry of a step: copy
+`integrator.u` and record `dt`, the step counter and whether `U` aliases or equals `u`;
+copy the tableau at the first step only.
+"""
 function begin_step!(obs, U)
     integrator = obs.integrator
     tab = integrator.cache.tableau
@@ -108,6 +132,12 @@ same_values(a, b) =
 
 state(U) = Dict{Symbol, Any}(:state => copy(U))
 
+"""
+    wrap_T_exp_T_lim(f!, obs)
+
+Wrap the `T_exp_T_lim!` hook (site `:L273`): point 2 in stage 1, after `begin_step!`, and
+point 11 in later stages. Entry copies `U`; exit copies `U`, `T_exp_i` and `T_lim_i`.
+"""
 function wrap_T_exp_T_lim(f!, obs)
     isnothing(f!) && return nothing
     return function (T_exp_i, T_lim_i, U, p, t)
@@ -130,6 +160,14 @@ function wrap_T_exp_T_lim(f!, obs)
     end
 end
 
+"""
+    wrap_lim(f!, obs)
+
+Wrap the `lim!` hook. Stage limiter (`:L160`, point 3): entry copies `U`, `u_ref` and the
+cached `T_imp` of the previous stage (point 12). Final limiter (`:L87`, point 14): entry
+also copies the channel arrays and weights of the final assembly (point 13). Exit copies
+`U`.
+"""
 function wrap_lim(f!, obs)
     isnothing(f!) && return nothing
     return function (U, p, t, u_ref)
@@ -201,6 +239,13 @@ function classify_dss!(obs)
     end
 end
 
+"""
+    wrap_dss(f!, obs)
+
+Wrap the `dss!` hook; `classify_dss!` maps the call to `:L202` (point 4), `:L216`
+(point 6), `:L245` (points 9 and 10) or the final `:L98` (points 15 and 16). Entry and
+exit copy `U`.
+"""
 function wrap_dss(f!, obs)
     isnothing(f!) && return nothing
     return function (U, p, t)
@@ -212,6 +257,12 @@ function wrap_dss(f!, obs)
     end
 end
 
+"""
+    wrap_constrain_state(f!, obs)
+
+Wrap the `constrain_state!` hook: final map `:L100` (point 17) or a call inside a stage
+(point 10). Entry and exit copy `U`.
+"""
 function wrap_constrain_state(f!, obs)
     isnothing(f!) && return nothing
     return function (U, p, t)
@@ -229,6 +280,12 @@ function wrap_constrain_state(f!, obs)
     end
 end
 
+"""
+    wrap_cache(f!, obs)
+
+Wrap the `cache!` hook: final map `:L101` (point 18), a call inside a stage (point 10) or
+initialization (point 0). Entry and exit copy `U`.
+"""
 function wrap_cache(f!, obs)
     isnothing(f!) && return nothing
     return function (U, p, t)
@@ -246,6 +303,13 @@ function wrap_cache(f!, obs)
     end
 end
 
+"""
+    wrap_cache_imp(f!, obs)
+
+Wrap the `cache_imp!` hook: `:L219` before the Newton solve (point 6), Newton-internal
+calls (`:newton`, point 0; `wrap_T_post_imp` relabels the last pair to `:L235`, point 8)
+and `:L253` (point 10). Entry and exit copy `U`.
+"""
 function wrap_cache_imp(f!, obs)
     isnothing(f!) && return nothing
     return function (U, p, t)
@@ -271,6 +335,12 @@ function wrap_cache_imp(f!, obs)
     end
 end
 
+"""
+    wrap_initialize_imp(f!, obs)
+
+Wrap the `initialize_imp!` hook (`:L215`): entry (point 5) and exit (point 6) copy `U`
+and record `dtγ`.
+"""
 function wrap_initialize_imp(f!, obs)
     isnothing(f!) && return nothing
     return function (U, p, dtγ)
@@ -287,6 +357,12 @@ function wrap_initialize_imp(f!, obs)
     end
 end
 
+"""
+    wrap_T_imp(f!, obs)
+
+Wrap the implicit tendency `T_imp!` called in the Newton solve (`:L311`, point 7): entry
+copies `U`; exit copies `U` and the output `T_imp_i`.
+"""
 function wrap_T_imp(f!, obs)
     return function (T_imp_i, U, p, t)
         site = obs.stage_phase == :newton ? :L311 : :unexpected
@@ -300,6 +376,12 @@ function wrap_T_imp(f!, obs)
     end
 end
 
+"""
+    wrap_Wfact(f!, obs)
+
+Wrap the Jacobian update `Wfact` called in the Newton solve (`:newton`, point 0): entry
+records `dtγ`; no state or Jacobian is copied.
+"""
 function wrap_Wfact(f!, obs)
     isnothing(f!) && return nothing
     return function (jacobian, U, p, dtγ, t)
@@ -315,6 +397,12 @@ function relabel(e::Event; point, site)
     return Event(e.step, e.stage, point, e.hook, e.phase, site, e.role, e.t, e.data)
 end
 
+"""
+    wrap_T_post_imp(f!, obs)
+
+Wrap the `T_post_imp!` hook after the Newton solve (`:L236`, point 9): entry copies `U`;
+exit copies `U` and the output `dU`. At entry, relabel the last Newton `cache_imp!` pair.
+"""
 function wrap_T_post_imp(f!, obs)
     isnothing(f!) && return nothing
     return function (dU, U, p, t)
@@ -433,7 +521,7 @@ function instrumented_integrator(
     return integrator
 end
 
-# Event path (B001 T9): a ClimaTimeSteppers with labelled solver events reports the solver
+# Event path: a ClimaTimeSteppers with labelled solver events reports the solver
 # internals that the path above reads from pinned cache fields and reconstructs with the
 # stage state machine. Only the model hooks are wrapped; everything else arrives as events.
 @static if isdefined(CTS, :supports_solver_events)
@@ -441,10 +529,11 @@ end
     """
         SITE_MAP
 
-    Solver-event sites (`CTS.Operation` `site`) mapped to the pinned 1.0.1 call-site label of
-    the prototype path, the hook called there and the B001 table rows of the entry and exit
-    records (local result, prototype; B001 T9). Sites outside the map do not execute with the
-    ClimaAtmos defaults; their events are recorded under their own name with hook `:operation`.
+    Solver-event sites (`CTS.Operation` `site`) mapped to the pinned 1.0.1 call-site label
+    of the prototype path, the hook called there and the event points (rows of the
+    first-gate acquisition table) of the entry and exit records. Sites outside the map do
+    not execute with the ClimaAtmos defaults; their events are recorded under their own
+    name with hook `:operation`.
     """
     const SITE_MAP = Dict{
         Symbol,
@@ -469,11 +558,11 @@ end
     """
         EventObserver(observer = Observer())
 
-    Solver observer for `CTS.init(prob, alg; solver_observer)` (local result, prototype;
-    B001 T9). Called with each solver event, it copies the borrowed payloads at once and
-    records `Event`s in `observer`: `StepStart` gives point 1, `StageBaseline` the implicit
-    baseline `temp` (site `:baseline`), `EffectiveStorage` point 12, `AssemblyInputs`
-    point 13 and `Operation` the entry and exit records of the call sites in `SITE_MAP`.
+    Solver observer for `CTS.init(prob, alg; solver_observer)`. Called with each solver
+    event, it copies the borrowed payloads at once and records `Event`s in `observer`:
+    `StepStart` gives point 1, `StageBaseline` the implicit baseline `temp` (site
+    `:baseline`), `EffectiveStorage` point 12, `AssemblyInputs` point 13 and `Operation`
+    the entry and exit records of the call sites in `SITE_MAP`.
     `Event.step` counts the steps seen by the observer, `Event.stage` is `ctx.stage`
     (`nothing` for step-level events) and `Event.t` is the step-start time `ctx.t`; the
     stage times of an `Operation` are in `data[:t_exp]` and `data[:t_imp]`. The observer
@@ -617,7 +706,7 @@ end
 
     Return a new `ClimaODEFunction` whose model hooks (`T_exp_T_lim!`, `T_imp!`, `Wfact`,
     `T_post_imp!`) record entry and exit events in `obs`; the solver-called hooks and the
-    update-signal policies are passed through unchanged (local result, prototype; B001 T9).
+    update-signal policies are passed through unchanged.
     """
     function wrap_model_hooks(f::CTS.ClimaODEFunction, obs::Observer)
         fields = fieldnames(typeof(f))
@@ -654,8 +743,8 @@ end
 
     Like `instrumented_integrator`, but the solver internals come from `CTS.init(...;
     solver_observer = obs)` and only the model hooks are wrapped (`wrap_model_hooks`). The
-    observer's step-end callback is appended after `callbacks`. Local result, prototype
-    (B001 T9); the stock integrator of `sim` must not be stepped.
+    observer's step-end callback is appended after `callbacks`. The stock integrator of
+    `sim` must not be stepped.
     """
     function instrumented_integrator_events(
         sim,
