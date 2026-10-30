@@ -87,10 +87,11 @@ When reviewing or writing changes, name the validation surface explicitly:
   - Float32 simulations may have looser MSE thresholds. Document this explicitly when setting a new threshold.
   - References are published **on merge** via a two-step **stage → publish** flow, not by a full `main` build. **Stage:** a green PR build's final step (`reproducibility_tests/stage_output.jl` → `stage_pr_data`) copies the bundle to `…/climaatmos-main-staging/pr-<n>/`. **Publish:** on `main`, `.buildkite/pipeline.yml` runs `reproducibility_tests/publish_reference.jl`, which moves it into the reference store. `move_data_to_save_dir` is the direct-publish path used only by a merge-queue build (dormant while a merge queue is off). See `reproducibility_tests/README.md`.
 
-## Acquisition prototype (first-gate accounting, B001)
+## Standalone solver-event tests
 
-  - `src/simulation/acquisition_prototype.jl` (module `ClimaAtmos.AcquisitionPrototype`, not exported) is a prototype for the first-gate accepted-step accounting: an `Observer` collects copied events from the `ClimaODEFunction` hooks that `args_integrator` wires, and `instrumented_integrator(sim, observer)` builds a second integrator from a fresh simulation's problem with the stock callbacks kept. Where no hook exists it reads ClimaTimeSteppers 1.0.1 internals (`cache.temp`, `cache.T_imp[i]`, the assembly channel arrays, `cache.tableau`), so it breaks if `IMEXARKCache` changes. It supports only ARS343 with the default cache and constraint update frequencies on the dry `DryBaroclinicWave` sphere fixture used by the test; without an observer no behaviour changes.
-  - Run its standalone test (not in `test/runtests.jl`, not run by CI) with `julia +1.11 --project=.buildkite test/acquisition_prototype.jl`.
+  - `test/acquisition_events.jl` and `test/acquisition_event_{channels,maps,energy,integrity}.jl` check ClimaAtmos model behaviour through ClimaTimeSteppers solver events. They need a ClimaTimeSteppers with labelled solver events, are not in `test/runtests.jl` and are not run by CI.
+  - `test/solver_event_consumer.jl` is their test-only observer: it records event kind and scalar context and copies payloads on receipt. Fixture-local wrappers in the test files record the hook evaluations that have no event of their own, labelled with the recorder's current stage.
+  - The first-gate event collector lives in the experiments harness, not in this repository.
 
 ## Local commands
 
