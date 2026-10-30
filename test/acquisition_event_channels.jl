@@ -10,20 +10,70 @@ import ClimaCore: CommonSpaces, Fields, Geometry, Spaces
 # (B001 T9 part 2, C037); not part of runtests.jl. Needs a ClimaTimeSteppers with labelled
 # solver events. Expected values are specified alongside the fixtures below, with
 # derivations for selected checks and exact identities for others.
-const AP = CA.AcquisitionPrototype
 println("CTS from ", pathof(CTS))
 
 include("acquisition_helpers.jl")
+include("solver_event_consumer.jl")
 report(name, value) = println(rpad(name, 60), " = ", value)
 
-# Runs one ARS343 step of `f` from `u0` through A's model-hook wrappers and event observer.
+# Fixture-local wrappers of the implicit tendency and the correction, which CTS does not
+# report per evaluation. Each calls the original hook once and records copies under the
+# recorder's current stage.
+function recorded_T_imp(f!, rec)
+    return function (T, U, p, t)
+        role = :provisional_evaluation
+        record_hook!(rec, :T_imp!, :entry, role, (; state = copy(U)))
+        result = f!(T, U, p, t)
+        record_hook!(rec, :T_imp!, :exit, role, (; state = copy(U), output = copy(T)))
+        return result
+    end
+end
+
+function recorded_T_post_imp(f!, rec)
+    isnothing(f!) && return nothing
+    return function (dU, U, p, t)
+        role = :correction_scratch
+        record_hook!(rec, :T_post_imp!, :entry, role, (; state = copy(U)))
+        result = f!(dU, U, p, t)
+        record_hook!(rec, :T_post_imp!, :exit, role, (; state = copy(U), output = copy(dU)))
+        return result
+    end
+end
+
+function wrap_hooks(f, rec)
+    T_imp! = if isnothing(f.T_imp!)
+        nothing
+    else
+        CTS.ODEFunction(
+            recorded_T_imp(f.T_imp!.f, rec);
+            jac_prototype = f.T_imp!.jac_prototype,
+            Wfact = f.T_imp!.Wfact,
+            tgrad = f.T_imp!.tgrad,
+        )
+    end
+    return CTS.ClimaODEFunction(;
+        f.T_exp_T_lim!,
+        T_imp!,
+        T_post_imp! = recorded_T_post_imp(f.T_post_imp!, rec),
+        f.lim!,
+        f.dss!,
+        f.constrain_state!,
+        f.initialize_imp!,
+        f.cache!,
+        f.cache_imp!,
+        f.update_cache,
+        f.update_constrain_state,
+    )
+end
+
+# Runs one ARS343 step of `f` from `u0` through the hook wrappers and the event recorder.
 function observed_step(f, u0, dt, p)
-    eobs = AP.EventObserver()
-    prob = CTS.ODEProblem(AP.wrap_model_hooks(f, eobs.observer), u0, (zero(dt), dt), p)
+    recorder = EventRecorder()
+    prob = CTS.ODEProblem(wrap_hooks(f, recorder), u0, (zero(dt), dt), p)
     alg = CTS.IMEXAlgorithm(CTS.ARS343(), CTS.NewtonsMethod(; max_iters = 1))
-    integrator = CTS.init(prob, alg; dt, solver_observer = eobs)
+    integrator = CTS.init(prob, alg; dt, solver_observer = recorder)
     CTS.step!(integrator)
-    return integrator, eobs.observer.events
+    return integrator, recorder.records
 end
 
 # Scalar Jacobian `W = dtγ ∂T/∂u − 1` of a one-element state, so Newton solves `W Δ = R`.
@@ -92,7 +142,7 @@ function check_claim2(::Type{FT}) where {FT}
     pairs = [
         (only(e for e in es if e.stage == s && e.phase == :entry),
             only(e for e in es if e.stage == s && e.phase == :exit)) for
-        (es, s) in ((stage, 2), (stage, 3), (stage, 4), (final, nothing))
+        (es, s) in ((stage, 2), (stage, 3), (stage, 4), (final, 0))
     ]
     report(
         "C037 claim 2 $FT limiter calls (stage, final, hook)",
@@ -140,7 +190,7 @@ end
 # contains the correction, so its subordinate children are not added again.
 function reconstruct(asm)
     u, dt, b_exp, b_imp = (asm.data[k] for k in (:u, :dt, :b_exp, :b_imp))
-    T_exp_all, T_imp_all = asm.data[:T_exp_all], asm.data[:T_imp_all]
+    T_exp_all, T_imp_all = asm.data[:T_exp], asm.data[:T_imp]
     return u[1] +
            dt * (
         sum(b_exp[j] * T[1] for (j, T) in T_exp_all) +
@@ -152,15 +202,15 @@ function check_claim3(::Type{FT}) where {FT}
     tol = bound(FT)
     for (correction, rate, endpoint) in ((false, 2, 3), (true, 5, 6))
         u, events = claim3(FT; correction)
-        stored = [e for e in events if e.site == :effective_storage]
+        stored = [e for e in events if e.kind == :EffectiveStorage]
         @test sort([e.stage for e in stored]) == [2, 3, 4]
-        @test all(abs(e.data[:T_imp_read][1] - rate) <= tol for e in stored)
+        @test all(abs(e.data[:T_imp_i][1] - rate) <= tol for e in stored)
         @test abs(u[1] - endpoint) <= tol
-        asm = only(e for e in events if e.site == :assembly_inputs)
+        asm = only(e for e in events if e.kind == :AssemblyInputs)
         @test abs(reconstruct(asm) - endpoint) <= tol
-        # Model-hook records of the correction (site :L236); the solver's applied-correction
-        # operation records carry the site :post_imp_correction.
-        children = [e for e in events if e.hook == :T_post_imp! && e.site == :L236]
+        # Hook-wrapper records of the correction; the solver's applied-correction operation
+        # records carry the site :post_imp_correction.
+        children = [e for e in events if e.kind == :hook && e.site == :T_post_imp!]
         ops = [e for e in events if e.site == :post_imp_correction]
         report(
             "C037 claim 3 $FT correction=$correction (endpoint, children, ops)",
@@ -211,7 +261,7 @@ function claim4(::Type{FT}) where {FT}
     )
     # γ of ARS343 is read from a dt = 1 pilot step's stage-2 baseline dtγ.
     _, pilot = observed_step(odef, FT[1], FT(1), nothing)
-    γ = only(e for e in pilot if e.site == :baseline && e.stage == 2).data[:dtγ]
+    γ = only(e for e in pilot if e.kind == :StageBaseline && e.stage == 2).ctx.dtγ
     _, events = observed_step(odef, FT[1], 1 / (4 * γ), nothing)
     return events
 end
@@ -219,12 +269,12 @@ end
 function check_claim4(::Type{FT}) where {FT}
     tol = bound(FT)
     events = claim4(FT)
-    evals = [e for e in events if e.hook == :T_imp! && e.stage == 2 && e.phase == :exit]
-    stored = only(e for e in events if e.site == :effective_storage && e.stage == 2)
+    evals = [e for e in events if e.site == :T_imp! && e.stage == 2 && e.phase == :exit]
+    stored = only(e for e in events if e.kind == :EffectiveStorage && e.stage == 2)
     h = stored.data[:dtγ]
     B = stored.data[:temp][1]
     U = stored.data[:U][1]
-    T_eff = stored.data[:T_imp_read][1]
+    T_eff = stored.data[:T_imp_i][1]
     # The one recorded physical evaluation is at the initial guess, state 1, output −1.
     @test length(evals) == 1
     recorded = only(evals)

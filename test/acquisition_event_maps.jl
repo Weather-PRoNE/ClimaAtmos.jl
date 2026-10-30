@@ -11,22 +11,22 @@ import ClimaCore.Utilities: half
 # part 2, C037 T3); not part of runtests.jl. Needs a ClimaTimeSteppers with labelled solver
 # events. Expected values are hand-derived from the fixtures (derivations at each fixture
 # below) or exact identities.
-const AP = CA.AcquisitionPrototype
 println("CTS from ", pathof(CTS))
 
 include("acquisition_helpers.jl")
+include("solver_event_consumer.jl")
 report(name, value) = println(rpad(name, 60), " = ", value)
 
 # `prepare!` acts on the state after `CTS.init`, whose own `cache!` call would otherwise
 # already apply the boundary setters to the initial state.
 function observed_step(f, u0, dt, p; prepare! = identity)
-    eobs = AP.EventObserver()
-    prob = CTS.ODEProblem(AP.wrap_model_hooks(f, eobs.observer), u0, (zero(dt), dt), p)
+    recorder = EventRecorder()
+    prob = CTS.ODEProblem(f, u0, (zero(dt), dt), p)
     alg = CTS.IMEXAlgorithm(CTS.ARS343(), CTS.NewtonsMethod(; max_iters = 1))
-    integrator = CTS.init(prob, alg; dt, solver_observer = eobs)
+    integrator = CTS.init(prob, alg; dt, solver_observer = recorder)
     prepare!(integrator.u)
     CTS.step!(integrator)
-    return integrator, eobs.observer.events
+    return integrator, recorder.records
 end
 
 struct ScalarW{FT}
@@ -121,8 +121,7 @@ final_pair(events, site) = (
     only(e for e in events if e.site == site && e.phase == :exit).data[:state],
 )
 
-promote(e) =
-    AP.Event(e.step, nothing, e.point, e.hook, e.phase, e.site, :final_map, e.t, e.data)
+promote(e) = EventRecord(e.kind, 0, e.ctx, e.site, e.phase, :final_map, e.data)
 
 # Covariant vertical component on one face level, through `Fields.level`.
 u₃_level(Y, l) = only(parent(Fields.level(Y.f.u₃.components.data.:1, l)))
@@ -201,11 +200,11 @@ function check_boundary(::Type{FT}) where {FT}
     )
     @test !isempty(children)
     @test all(e.role == :subordinate_stage_write for (_, e) in children)
-    ka = findfirst(x -> x.site == :assembly_inputs, events)
+    ka = findfirst(x -> x.kind == :AssemblyInputs, events)
     @test all(k < ka for (k, _) in children)
     # The step-start state equals the assembly input, since all rates vanish.
     Y_asm, dss_exit = final_pair(events, :final_dss)
-    @test exact_equal(Y_asm, only(e for e in events if e.hook == :step_start).data[:u])
+    @test exact_equal(Y_asm, only(e for e in events if e.kind == :StepStart).data[:u])
 
     # Top-level reconstruction from the final-map increments, without the stage children.
     increments = [
@@ -242,12 +241,12 @@ from the observed assembly inputs and the solver's own Y_asm are two evaluations
 =#
 function check_stage_writes(::Type{FT}) where {FT}
     integrator, events = boundary_run(FT; stage_writes = true)
-    a = only(e for e in events if e.site == :assembly_inputs).data
+    a = only(e for e in events if e.kind == :AssemblyInputs).data
     weighted(b, T) = [(b[j], T[j]) for j in keys(T)]
     all_terms = vcat(
-        weighted(a[:b_exp], a[:T_exp_all]),
-        weighted(a[:b_exp], a[:T_lim_all]),
-        weighted(a[:b_imp], a[:T_imp_all]),
+        weighted(a[:b_exp], a[:T_exp]),
+        weighted(a[:b_exp], a[:T_lim]),
+        weighted(a[:b_imp], a[:T_imp]),
     )
     recon = copy(a[:u])
     scale = abs.(a[:u])
@@ -259,7 +258,7 @@ function check_stage_writes(::Type{FT}) where {FT}
     tol = 32 * eps(FT) * S
     Y_asm, _ = final_pair(events, :final_dss)
     # The stage writes are contained in the effective storage of the implicit stages.
-    eff = [e.data[:T_imp_read] for e in events if e.site == :effective_storage]
+    eff = [e.data[:T_imp_i] for e in events if e.kind == :EffectiveStorage]
     report(
         "C037 claim 5 $FT stage writes: max |effective T_imp| per stage",
         [maximum(abs, parent(x.f)) for x in eff],

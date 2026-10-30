@@ -9,9 +9,9 @@ import ClimaTimeSteppers as CTS
 # part 2, C037 T3); not part of runtests.jl. Needs a ClimaTimeSteppers with labelled solver
 # events. The expected event trace for this configuration is specified below; all
 # comparisons are exact except the endpoint value (see `endpoint_bound`).
-const AP = CA.AcquisitionPrototype
 println("CTS from ", pathof(CTS))
 
+include("solver_event_consumer.jl")
 report(name, value) = println(rpad(name, 60), " = ", value)
 
 struct ScalarW{FT}
@@ -50,7 +50,7 @@ function (g::Guard)(event)
     return nothing
 end
 
-# Fault observer: records like A's observer, then changes one supplied state slot by 1.
+# Fault observer: records like the recorder, then changes one supplied state slot by 1.
 mutable struct Tamper{O}
     inner::O
     done::Bool
@@ -99,20 +99,67 @@ eps/2 on magnitudes ≤ 12 gives ≤ 32 · 12 · eps/2 = 192 eps; we use 256 eps
 =#
 endpoint_bound(::Type{FT}) where {FT} = 256 * eps(FT)
 
-function guarded_step(::Type{FT}; tamper = false) where {FT}
-    eobs = AP.EventObserver()
-    guard = Guard(tamper ? Tamper(eobs, false) : eobs)
-    p = (; sentinel = FT[7])
-    prob = CTS.ODEProblem(
-        AP.wrap_model_hooks(hooks(FT), eobs.observer),
-        FT[0],
-        (FT(0), FT(1)),
-        p,
+# Fixture-local wrappers of the model hooks CTS does not bracket with an event. Each calls
+# the original hook once and records copies under the recorder's current stage.
+function wrap_hooks(f, rec)
+    T_exp_T_lim! = function (T_exp, T_lim, U, p, t)
+        role = :stage_tendency
+        record_hook!(rec, :T_exp_T_lim!, :entry, role, (; state = copy(U)))
+        result = f.T_exp_T_lim!(T_exp, T_lim, U, p, t)
+        data = (; state = copy(U), T_exp = copy(T_exp), T_lim = copy(T_lim))
+        record_hook!(rec, :T_exp_T_lim!, :exit, role, data)
+        return result
+    end
+    T_imp = function (T, U, p, t)
+        role = :provisional_evaluation
+        record_hook!(rec, :T_imp!, :entry, role, (; state = copy(U)))
+        result = f.T_imp!.f(T, U, p, t)
+        record_hook!(rec, :T_imp!, :exit, role, (; state = copy(U), output = copy(T)))
+        return result
+    end
+    Wfact = function (W, U, p, dtγ, t)
+        role = :jacobian_update
+        record_hook!(rec, :Wfact, :entry, role, (; dtγ))
+        result = f.T_imp!.Wfact(W, U, p, dtγ, t)
+        record_hook!(rec, :Wfact, :exit, role, (;))
+        return result
+    end
+    T_post_imp! = function (dU, U, p, t)
+        role = :correction_scratch
+        record_hook!(rec, :T_post_imp!, :entry, role, (; state = copy(U)))
+        result = f.T_post_imp!(dU, U, p, t)
+        record_hook!(rec, :T_post_imp!, :exit, role, (; state = copy(U), output = copy(dU)))
+        return result
+    end
+    return CTS.ClimaODEFunction(;
+        T_exp_T_lim!,
+        T_imp! = CTS.ODEFunction(
+            T_imp;
+            jac_prototype = f.T_imp!.jac_prototype,
+            Wfact,
+            tgrad = f.T_imp!.tgrad,
+        ),
+        T_post_imp!,
+        f.lim!,
+        f.dss!,
+        f.constrain_state!,
+        f.initialize_imp!,
+        f.cache!,
+        f.cache_imp!,
+        f.update_cache,
+        f.update_constrain_state,
     )
+end
+
+function guarded_step(::Type{FT}; tamper = false) where {FT}
+    recorder = EventRecorder()
+    guard = Guard(tamper ? Tamper(recorder, false) : recorder)
+    p = (; sentinel = FT[7])
+    prob = CTS.ODEProblem(wrap_hooks(hooks(FT), recorder), FT[0], (FT(0), FT(1)), p)
     alg = CTS.IMEXAlgorithm(CTS.ARS343(), CTS.NewtonsMethod(; max_iters = 1))
     integrator = CTS.init(prob, alg; dt = FT(1), solver_observer = guard)
     CTS.step!(integrator)
-    return integrator, eobs.observer.events, guard
+    return integrator, recorder.records, guard
 end
 
 function check_no_write(::Type{FT}) where {FT}
@@ -133,81 +180,61 @@ function check_no_write(::Type{FT}) where {FT}
     @test count(!, guard_f.clean) == 1
     # Stage-2 copies survive the later reuse of the borrowed buffer.
     borrowed, snapshot = only(guard.stage2)
-    retained =
-        only(e for e in events if e.site == :effective_storage && e.stage == 2).data[:U]
+    kept = only(e for e in events if e.kind == :EffectiveStorage && e.stage == 2).data[:U]
     report(
         "C037 claim 7 $FT stage-2 U (retained, snapshot, buffer now)",
-        (retained, snapshot, borrowed),
+        (kept, snapshot, borrowed),
     )
-    @test retained == snapshot
-    @test retained !== borrowed
+    @test kept == snapshot
+    @test kept !== borrowed
     @test borrowed != snapshot
 end
 
-# Wrapped and unwrapped model hooks on cloned arguments: only the declared outputs change,
-# and identically.
-function check_wrappers(::Type{FT}) where {FT}
-    f = hooks(FT)
-    wf = AP.wrap_model_hooks(f, AP.Observer())
-    calls = (
-        T_exp_T_lim! = (h, args) -> h.T_exp_T_lim!(args...),
-        T_imp! = (h, args) -> h.T_imp!.f(args...),
-        T_post_imp! = (h, args) -> h.T_post_imp!(args...),
-    )
-    nouts = (T_exp_T_lim! = 2, T_imp! = 1, T_post_imp! = 1)
-    for name in keys(calls)
-        n = nouts[name]
-        make() = (ntuple(_ -> FT[-99], n)..., FT[0.5], (; sentinel = FT[7]), FT(0))
-        a, b = make(), make()
-        calls[name](f, a)
-        calls[name](wf, b)
-        @test all(a[k] == b[k] && a[k] != FT[-99] for k in 1:n)
-        @test a[n + 1] == b[n + 1] == FT[0.5]
-        @test a[n + 2].sentinel == b[n + 2].sentinel == FT[7]
-    end
-end
-
 #=
-Complete ordered event template for this configuration: (site, stage, phase, role). Oracle:
-C037 T0 Section 7 (docs/migration/runs/20261022T211801Z-C005-pi-test-designer.md:391–420)
+Complete ordered event template for this configuration: (kind, site, stage, phase, role).
+Oracle: C037 T0 Section 7 (docs/migration/runs/20261022T211801Z-C005-pi-test-designer.md:391–420)
 and the source-derived table of C037 T3-research Finding 2 (docs/build/c037/t3-research.md),
 column "both policies step-only": there the post-DSS fallback `cache_imp!`
 (`:stage_cache_fallback`) takes the place of the stage `cache!` (`:stage_cache_post`).
 =#
-pair(site, stage, role) = ((site, stage, :entry, role), (site, stage, :exit, role))
+pair(kind, site, stage, role) =
+    ((kind, site, stage, :entry, role), (kind, site, stage, :exit, role))
+op(site, stage, role) = pair(:Operation, site, stage, role)
+hook(site, stage, role) = pair(:hook, site, stage, role)
+solver(kind, stage) = (kind, nothing, stage, nothing, nothing)
 stage_block(s) = (
-    pair(:stage_lim, s, :stage_construction)...,
-    pair(:stage_dss_pre, s, :stage_construction)...,
-    (:baseline, s, :exit, :implicit_setup),
-    pair(:init_imp, s, :stage_processing)...,
-    pair(:stage_dss_post_init, s, :stage_processing)...,
-    pair(:cache_imp_pre_newton, s, :subordinate_stage_write)...,
-    pair(:L311, s, :provisional_evaluation)...,
-    pair(:newton, s, :jacobian_update)...,
-    pair(:cache_imp_post_newton, s, :subordinate_stage_write)...,
-    (:post_imp_correction, s, :entry, :subordinate_stage_write),
-    pair(:L236, s, :correction_scratch)...,
-    (:post_imp_correction, s, :exit, :subordinate_stage_write),
-    pair(:stage_dss_post, s, :stage_processing)...,
-    pair(:stage_cache_fallback, s, :subordinate_stage_write)...,
-    pair(:L273, s, :stage_tendency)...,
-    (:effective_storage, s, :exit, :effective_storage),
+    op(:stage_lim, s, :stage_construction)...,
+    op(:stage_dss_pre, s, :stage_construction)...,
+    solver(:StageBaseline, s),
+    op(:init_imp, s, :stage_processing)...,
+    op(:stage_dss_post_init, s, :stage_processing)...,
+    op(:cache_imp_pre_newton, s, :subordinate_stage_write)...,
+    hook(:T_imp!, s, :provisional_evaluation)...,
+    hook(:Wfact, s, :jacobian_update)...,
+    op(:cache_imp_post_newton, s, :subordinate_stage_write)...,
+    (:Operation, :post_imp_correction, s, :entry, :subordinate_stage_write),
+    hook(:T_post_imp!, s, :correction_scratch)...,
+    (:Operation, :post_imp_correction, s, :exit, :subordinate_stage_write),
+    op(:stage_dss_post, s, :stage_processing)...,
+    op(:stage_cache_fallback, s, :subordinate_stage_write)...,
+    hook(:T_exp_T_lim!, s, :stage_tendency)...,
+    solver(:EffectiveStorage, s),
 )
 const TEMPLATE = [
-    (:L70, 1, :entry, :step_start),
-    pair(:L273, 1, :stage_tendency)...,
+    solver(:StepStart, 1),
+    hook(:T_exp_T_lim!, 1, :stage_tendency)...,
     (x for s in 2:4 for x in stage_block(s))...,
-    (:assembly_inputs, nothing, :entry, :final_assembly),
-    pair(:final_lim, nothing, :final_limiter)...,
+    solver(:AssemblyInputs, 0),
+    op(:final_lim, 0, :final_limiter)...,
     (
         x for s in (:final_dss, :final_constrain, :final_cache) for
-        x in pair(s, nothing, :final_map)
+        x in op(s, 0, :final_map)
     )...,
 ]
 # T0 Section 7 totals: fused explicit 4, cache_imp! 9, dss! 10, T_post_imp! 3,
 # initialize_imp! 3, constrain_state! 1, cache! 1 (stage sites as emitted by the fork).
 const COUNT_SITES = (
-    explicit = (4, (:L273,)),
+    explicit = (4, (:T_exp_T_lim!,)),
     cache_imp = (9, (:cache_imp_pre_newton, :cache_imp_post_newton, :stage_cache_fallback)),
     dss = (10, (:stage_dss_pre, :stage_dss_post_init, :stage_dss_post, :final_dss)),
     post_imp = (3, (:post_imp_correction,)),
@@ -216,7 +243,7 @@ const COUNT_SITES = (
     cache = (1, (:final_cache, :stage_cache_post, :stage_cache_no_implicit)),
 )
 
-required(events) = [(e.site, e.stage, e.phase, e.role) for e in events]
+required(events) = [(e.kind, e.site, e.stage, e.phase, e.role) for e in events]
 counts(events) = map(
     ((_, sites),) -> count(e -> e.site in sites && e.phase == :entry, events),
     COUNT_SITES,
@@ -244,9 +271,9 @@ function check_template(::Type{FT}) where {FT}
     @test template_accepted(events)
     # Template controls (negative controls of this test's template, not A-side claim-7
     # coverage): remove a baseline, duplicate the final cache pair, swap two final maps.
-    find(site, phase; stage = nothing) =
+    find(site, phase; stage = 0) =
         findfirst(e -> e.site == site && e.phase == phase && e.stage == stage, events)
-    kb = find(:baseline, :exit; stage = 3)
+    kb = findfirst(e -> e.kind == :StageBaseline && e.stage == 3, events)
     removed = deleteat!(copy(events), kb)
     kc = find(:final_cache, :entry)
     duplicated = vcat(events[1:(kc + 1)], events[kc:(kc + 1)], events[(kc + 2):end])
@@ -261,7 +288,6 @@ end
 @testset "C037 event integrity" begin
     for FT in (Float32, Float64)
         @testset "claim 7 observer no-write $FT" check_no_write(FT)
-        @testset "claim 7 wrapped hooks $FT" check_wrappers(FT)
         @testset "claim 7 lifecycle template $FT" check_template(FT)
     end
 end

@@ -10,9 +10,9 @@ import ClimaCore.Utilities: half
 # part 2, C037 T3); not part of runtests.jl. Needs a ClimaTimeSteppers with labelled solver
 # events. Expected values are hand-derived from the states below; these are diagnostic
 # states, not an atmospheric evolution.
-const AP = CA.AcquisitionPrototype
 println("CTS from ", pathof(CTS))
 
+include("solver_event_consumer.jl")
 report(name, value) = println(rpad(name, 60), " = ", value)
 
 #=
@@ -68,16 +68,15 @@ function energy_run(::Type{FT}; z_elem) where {FT}
             (fill!(T_exp, 0); fill!(T_lim, 0); nothing),
         constrain_state!,
     )
-    eobs = AP.EventObserver()
-    prob =
-        CTS.ODEProblem(AP.wrap_model_hooks(odef, eobs.observer), Y, (FT(0), FT(1)), nothing)
+    recorder = EventRecorder()
+    prob = CTS.ODEProblem(odef, Y, (FT(0), FT(1)), nothing)
     alg = CTS.IMEXAlgorithm(CTS.ARS343(), CTS.NewtonsMethod(; max_iters = 1))
-    integrator = CTS.init(prob, alg; dt = FT(1), solver_observer = eobs)
+    integrator = CTS.init(prob, alg; dt = FT(1), solver_observer = recorder)
     # `CTS.init` may apply the final maps to the initial state; the step starts from START.
     integrator.u .= state(FT, START; z_elem)
     CTS.step!(integrator)
-    events = eobs.observer.events
-    start = only(e for e in events if e.hook == :step_start).data[:u]
+    events = recorder.records
+    start = only(e for e in events if e.kind == :StepStart).data[:u]
     final_end =
         only(e for e in events if e.site == :final_cache && e.phase == :exit).data[:state]
     return start, final_end, events
