@@ -12,8 +12,8 @@ wrappers; standalone, not part of runtests.jl. Needs a ClimaTimeSteppers with la
 events. One ARS343 step of an active case and of a matched control with the limiter
 disabled, in Float32 and Float64. The chemistry stays a no-op: `Musica` is not imported.
 
-Frozen before any activity assertion, from stage-1 operands and pre-limiter states of the
-limiter-off case only:
+The operands and pre-limiter states come from the active records, which equal the control's
+through `exact_equal(control_entry, entry)`.
 
 - Tracer: `q = q₀ + a 𝟏[(i, j) = (3, 2)]` in slab (h*, v*), a = 1/16, q₀ = a/64 = 1/1024.
 - Slab: `select_slab` on the stage-1 tendency state gives (h*, v*) = (1, 7) in both precisions;
@@ -29,8 +29,8 @@ limiter-off case only:
     Float64: the same plus (1,4)
   Redistribution values are not asserted, nor is (2, 2) the only clipped node. Outside this
   slab the q₀S term also triggers clipping, so nowhere else is activity asserted.
-- Activity margin, for dtγ with dt = 1, γ = a_exp[2,1]. Predicted undershoot at the target
-  U = dt γ (aC + q₀S) ≥ dt γ aC/2 = 6.03e-8.
+- Activity margin, with γ = a_exp[2,1]; the values are at the configured dt = 1. Predicted
+  undershoot at the target U = dt γ (aC + q₀S) ≥ dt γ aC/2 = 6.03e-8.
   Size of the background correction in U: dt γ q₀|S| = 5.45e-11, 4.5e-4 of U.
   All nodal operands of the clipped target lie near M = ρ₂₂q₀ = 3.619e-4: the pre-limiter
   value and the clipped value `ρ q_min`. `ρ q_max` enters only nodes clipped to the upper
@@ -42,12 +42,12 @@ limiter-off case only:
     second the initialization, division, stage accumulation and clipping at the target.
     Float32: τ = 3.45e-10, E_A = 1.73e-10, U/(τ + E_A) = 232.7
     Float64: τ = 6.43e-19, E_A = 3.22e-19, U/(τ + E_A) = 1.25e11
-  The predeclared ratio is ≥ 16 in both precisions; it is a stop, not a tuning parameter.
-  τ covers round-off only here; the experiments' assembly tolerance is not part of it.
+  The undershoot and the correction at the target are each asserted to be at least
+  `MIN_MARGIN` = 16 times τ + E_A in both precisions. τ covers round-off only.
 - Tolerances: reconstructed bounds 16 eps(FT) relative to the bound (clipping and rounding
   of the mean, a few rounded operations); slab tracer mass 64 eps(FT) relative to the slab
   mass (limiter `rtol = eps`, 16-term summations, node write rounding).
-- Final-limiter activity is recorded, not asserted, and is not D026 acceptance.
+- Final-limiter activity is recorded, not asserted.
 =#
 println("CTS from ", pathof(CTS))
 
@@ -269,20 +269,23 @@ function check_setup(::Type{FT}, active, control) where {FT}
         es = run.records
         Y_n = only(e for e in es if e.kind == :StepStart).data[:u]
         U₁ = hook(es, :T_exp_T_lim!, 1, :entry).data[:state]
-        # C4: the setup holds the test's tracer, and the stage-2 entry keeps the density.
+        # The setup holds the test's tracer, and the stage-2 entry keeps the density.
         @test parent(run.initial_tracer) == parent(Y_n.c.ρq_gas_A)
         @test parent(operation(es, :stage_lim, 2, :entry).data[:state].c.ρ) ==
               parent(Y_n.c.ρ)
-        # C3: the operands come from the stage-1 tendency state.
+        # The operands come from the stage-1 tendency state.
         report("$FT max|U₁ - StepStart|", maxdiff(U₁, Y_n))
         @test maxdiff(U₁, Y_n) == 0
     end
     @test parent(active.initial_tracer) == parent(control.initial_tracer)
     ρq₀ = parent(active.initial_tracer)
+    Y_n = only(e for e in active.records if e.kind == :StepStart).data[:u]
+    q₀ = ρq₀ ./ parent(Y_n.c.ρ)
     @test size(ρq₀) == (10, 4, 4, 1, 24)
     @test all(>(0), ρq₀)
-    @test count(ρq₀ .> 2 * FT(BACKGROUND_Q0)) == 1
-    @test ρq₀[v, 3, 2, 1, h] > FT(SPIKE_A) * minimum(parent(active.integrator.u.c.ρ))
+    @test count(q₀ .> 2 * FT(BACKGROUND_Q0)) == 1
+    # The product `ρ q` written by the setup and this division each round once.
+    @test isapprox(q₀[v, 3, 2, 1, h], FT(BACKGROUND_Q0 + SPIKE_A); rtol = 2 * eps(FT))
 end
 
 function check_events(::Type{FT}, active, control) where {FT}
@@ -329,7 +332,8 @@ function check_activity(::Type{FT}, active, control) where {FT}
 
     u = Float64(eps(FT)) / 2
     γ_n(n) = n * u / (1 - n * u)
-    dtγ = Float64(active.integrator.cache.tableau.a_exp[2, 1])
+    dt = Float64(float(active.integrator.dt))
+    dtγ = dt * Float64(active.integrator.cache.tableau.a_exp[2, 1])
     q = Float64.(parent(U₁.c.ρq_gas_A)) ./ Float64.(parent(U₁.c.ρ))
     predicted = split_tendency(op, q, v, h)
     M = t.ρ₂₂ * BACKGROUND_Q0
@@ -359,12 +363,12 @@ function check_activity(::Type{FT}, active, control) where {FT}
     report("$FT undershoot margin", margin)
     @test abs(undershoot - predicted_undershoot) ≤ E_A
     @test margin ≥ MIN_MARGIN
-    @test correction > τ + E_A
+    @test correction ≥ MIN_MARGIN * (τ + E_A)
     @test correction ≥ undershoot - E_A
 
-    # The control enters the limiter with the same state and leaves it unchanged.
+    # The control enters the limiter with the same state and leaves the target at another
+    # value; the testset "control is an exact no-op" covers the control's limiter calls.
     @test exact_equal(control_entry, entry)
-    @test exact_equal(control_exit, control_entry)
     @test parent(control_exit.c.ρq_gas_A)[v, 2, 2, 1, h] !=
           parent(exit.c.ρq_gas_A)[v, 2, 2, 1, h]
 
@@ -440,6 +444,8 @@ end
         control = observed_step(FT, assemble(FT, false), SPIKE_SLAB)
         check_setup(FT, active, control)
     end
+    # A throw in the setup is already reported; the remaining checks need both runs.
+    (isnothing(active) || isnothing(control)) && continue
     @testset "limiter event structure" begin
         check_events(FT, active, control)
     end
