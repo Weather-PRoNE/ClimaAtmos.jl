@@ -99,58 +99,6 @@ eps/2 on magnitudes ≤ 12 gives ≤ 32 · 12 · eps/2 = 192 eps; we use 256 eps
 =#
 endpoint_bound(::Type{FT}) where {FT} = 256 * eps(FT)
 
-# Fixture-local wrappers of the model hooks CTS does not bracket with an event. Each calls
-# the original hook once and records copies under the recorder's current stage.
-function wrap_hooks(f, rec)
-    T_exp_T_lim! = function (T_exp, T_lim, U, p, t)
-        role = :stage_tendency
-        record_hook!(rec, :T_exp_T_lim!, :entry, role, (; state = copy(U)))
-        result = f.T_exp_T_lim!(T_exp, T_lim, U, p, t)
-        data = (; state = copy(U), T_exp = copy(T_exp), T_lim = copy(T_lim))
-        record_hook!(rec, :T_exp_T_lim!, :exit, role, data)
-        return result
-    end
-    T_imp = function (T, U, p, t)
-        role = :provisional_evaluation
-        record_hook!(rec, :T_imp!, :entry, role, (; state = copy(U)))
-        result = f.T_imp!.f(T, U, p, t)
-        record_hook!(rec, :T_imp!, :exit, role, (; state = copy(U), output = copy(T)))
-        return result
-    end
-    Wfact = function (W, U, p, dtγ, t)
-        role = :jacobian_update
-        record_hook!(rec, :Wfact, :entry, role, (; dtγ))
-        result = f.T_imp!.Wfact(W, U, p, dtγ, t)
-        record_hook!(rec, :Wfact, :exit, role, (;))
-        return result
-    end
-    T_post_imp! = function (dU, U, p, t)
-        role = :correction_scratch
-        record_hook!(rec, :T_post_imp!, :entry, role, (; state = copy(U)))
-        result = f.T_post_imp!(dU, U, p, t)
-        record_hook!(rec, :T_post_imp!, :exit, role, (; state = copy(U), output = copy(dU)))
-        return result
-    end
-    return CTS.ClimaODEFunction(;
-        T_exp_T_lim!,
-        T_imp! = CTS.ODEFunction(
-            T_imp;
-            jac_prototype = f.T_imp!.jac_prototype,
-            Wfact,
-            tgrad = f.T_imp!.tgrad,
-        ),
-        T_post_imp!,
-        f.lim!,
-        f.dss!,
-        f.constrain_state!,
-        f.initialize_imp!,
-        f.cache!,
-        f.cache_imp!,
-        f.update_cache,
-        f.update_constrain_state,
-    )
-end
-
 function guarded_step(::Type{FT}; tamper = false) where {FT}
     recorder = EventRecorder()
     guard = Guard(tamper ? Tamper(recorder, false) : recorder)
@@ -290,4 +238,8 @@ end
         @testset "claim 7 observer no-write $FT" check_no_write(FT)
         @testset "claim 7 lifecycle template $FT" check_template(FT)
     end
+end
+
+@testset "wrap_hooks field guard" begin
+    @test_throws ErrorException wrap_hooks((; T_imp! = nothing), EventRecorder())
 end

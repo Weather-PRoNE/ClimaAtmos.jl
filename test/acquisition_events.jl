@@ -29,7 +29,7 @@ config = CA.AtmosConfig(
         "disable_surface_flux_tendency" => true,
         "output_dir" => mktempdir(),
     );
-    job_id = "b003_acquisition_events",
+    job_id = "acquisition_events",
 )
 # Construction inside a testset so that a setup error still prints a summary.
 @testset "setup" begin
@@ -53,71 +53,6 @@ field_reldiff(a, b) = map(
     fields(a),
     fields(b),
 )
-
-# Fixture-local wrappers of the model hooks CTS does not bracket with an event. Each calls
-# the original hook once and records copies under the recorder's current stage.
-function recorded_T_exp_T_lim(f!, rec)
-    return function (T_exp, T_lim, U, p, t)
-        role = :stage_tendency
-        record_hook!(rec, :T_exp_T_lim!, :entry, role, (; state = copy(U)))
-        result = f!(T_exp, T_lim, U, p, t)
-        data = (; state = copy(U), T_exp = copy(T_exp), T_lim = copy(T_lim))
-        record_hook!(rec, :T_exp_T_lim!, :exit, role, data)
-        return result
-    end
-end
-
-function recorded_T_imp(f!, rec)
-    return function (T, U, p, t)
-        role = :provisional_evaluation
-        record_hook!(rec, :T_imp!, :entry, role, (; state = copy(U)))
-        result = f!(T, U, p, t)
-        record_hook!(rec, :T_imp!, :exit, role, (; state = copy(U), output = copy(T)))
-        return result
-    end
-end
-
-function recorded_Wfact(f!, rec)
-    return function (W, U, p, dtγ, t)
-        role = :jacobian_update
-        record_hook!(rec, :Wfact, :entry, role, (; dtγ))
-        result = f!(W, U, p, dtγ, t)
-        record_hook!(rec, :Wfact, :exit, role, (;))
-        return result
-    end
-end
-
-function recorded_T_post_imp(f!, rec)
-    return function (dU, U, p, t)
-        role = :correction_scratch
-        record_hook!(rec, :T_post_imp!, :entry, role, (; state = copy(U)))
-        result = f!(dU, U, p, t)
-        record_hook!(rec, :T_post_imp!, :exit, role, (; state = copy(U), output = copy(dU)))
-        return result
-    end
-end
-
-function wrap_hooks(f, rec)
-    T_imp! = CTS.ODEFunction(
-        recorded_T_imp(f.T_imp!.f, rec);
-        jac_prototype = f.T_imp!.jac_prototype,
-        Wfact = recorded_Wfact(f.T_imp!.Wfact, rec),
-        tgrad = f.T_imp!.tgrad,
-    )
-    return CTS.ClimaODEFunction(;
-        T_exp_T_lim! = recorded_T_exp_T_lim(f.T_exp_T_lim!, rec),
-        T_imp!,
-        T_post_imp! = recorded_T_post_imp(f.T_post_imp!, rec),
-        f.lim!,
-        f.dss!,
-        f.constrain_state!,
-        f.initialize_imp!,
-        f.cache!,
-        f.cache_imp!,
-        f.update_cache,
-        f.update_constrain_state,
-    )
-end
 
 @testset "environment" begin
     @test CTS.supports_solver_events(stock.alg)
@@ -259,6 +194,13 @@ end
         @test Δf.bottom > 0
         @test Δf.top > 0
         @test Δf.interior == 0
+    end
+    # The post-DSS fallback `cache_imp!` leaves the state unchanged.
+    for stage in 2:4
+        in_stage = [e for e in es if e.stage == stage]
+        entry = at_site(in_stage, :stage_cache_fallback, :entry)
+        exit = at_site(in_stage, :stage_cache_fallback, :exit)
+        @test exact_equal(entry.data[:state], exit.data[:state])
     end
 end
 

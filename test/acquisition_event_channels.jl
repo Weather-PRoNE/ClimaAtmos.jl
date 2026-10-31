@@ -16,60 +16,12 @@ include("acquisition_helpers.jl")
 include("solver_event_consumer.jl")
 report(name, value) = println(rpad(name, 60), " = ", value)
 
-# Fixture-local wrappers of the implicit tendency and the correction, which CTS does not
-# report per evaluation. Each calls the original hook once and records copies under the
-# recorder's current stage.
-function recorded_T_imp(f!, rec)
-    return function (T, U, p, t)
-        role = :provisional_evaluation
-        record_hook!(rec, :T_imp!, :entry, role, (; state = copy(U)))
-        result = f!(T, U, p, t)
-        record_hook!(rec, :T_imp!, :exit, role, (; state = copy(U), output = copy(T)))
-        return result
-    end
-end
-
-function recorded_T_post_imp(f!, rec)
-    isnothing(f!) && return nothing
-    return function (dU, U, p, t)
-        role = :correction_scratch
-        record_hook!(rec, :T_post_imp!, :entry, role, (; state = copy(U)))
-        result = f!(dU, U, p, t)
-        record_hook!(rec, :T_post_imp!, :exit, role, (; state = copy(U), output = copy(dU)))
-        return result
-    end
-end
-
-function wrap_hooks(f, rec)
-    T_imp! = if isnothing(f.T_imp!)
-        nothing
-    else
-        CTS.ODEFunction(
-            recorded_T_imp(f.T_imp!.f, rec);
-            jac_prototype = f.T_imp!.jac_prototype,
-            Wfact = f.T_imp!.Wfact,
-            tgrad = f.T_imp!.tgrad,
-        )
-    end
-    return CTS.ClimaODEFunction(;
-        f.T_exp_T_lim!,
-        T_imp!,
-        T_post_imp! = recorded_T_post_imp(f.T_post_imp!, rec),
-        f.lim!,
-        f.dss!,
-        f.constrain_state!,
-        f.initialize_imp!,
-        f.cache!,
-        f.cache_imp!,
-        f.update_cache,
-        f.update_constrain_state,
-    )
-end
-
-# Runs one ARS343 step of `f` from `u0` through the hook wrappers and the event recorder.
+# Runs one ARS343 step of `f` from `u0` through the event recorder, with wrappers of the
+# implicit tendency and the correction, which CTS does not report per evaluation.
 function observed_step(f, u0, dt, p)
     recorder = EventRecorder()
-    prob = CTS.ODEProblem(wrap_hooks(f, recorder), u0, (zero(dt), dt), p)
+    wrapped = wrap_hooks(f, recorder; record_T_exp_T_lim = false, record_Wfact = false)
+    prob = CTS.ODEProblem(wrapped, u0, (zero(dt), dt), p)
     alg = CTS.IMEXAlgorithm(CTS.ARS343(), CTS.NewtonsMethod(; max_iters = 1))
     integrator = CTS.init(prob, alg; dt, solver_observer = recorder)
     CTS.step!(integrator)
