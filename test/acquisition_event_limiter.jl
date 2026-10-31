@@ -104,8 +104,8 @@ function set_tracer!(Y, ::Type{FT}, spike) where {FT}
     return Y
 end
 
-# The tracer must be in `Y` before `build_cache`, so the stages of `AtmosSimulation` are
-# spelled out here; `AtmosSimulation` builds its own state and cache from the model.
+# The tracer is written to Y before build_cache, so the stages of AtmosSimulation are
+# spelled out here.
 function assemble(::Type{FT}, sem) where {FT}
     config = limiter_config(FT, sem)
     pa = config.parsed_args
